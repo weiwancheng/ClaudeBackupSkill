@@ -1,16 +1,28 @@
 ---
 name: claude-migrate
 description: |
-  Claude Code 一键迁移/备份 Skill（v3.0）。将所有积累（skills、memory、settings、.claude.json、rules、agents、commands、定时任务）备份到 Git 仓库，支持跨机器还原和定期远程推送。
+  Claude Code 一键迁移/备份 Skill（v3.1）。将所有积累（skills、memory、settings、.claude.json、rules、agents、commands、定时任务、规划方案）备份到 Git 仓库，支持跨机器还原和定期远程推送。
+  v3.1 新增：plans/备份（full tier）、项目根CLAUDE.md发现增强、smart-merge权限还原、stats独立还原模块、manifest精准检测、完整性校验失败退出（--force跳过）、--version参数。
   v3.0 新增：原子备份、SHA-256 完整性校验、智能合并还原（不覆盖本机敏感值）、隐私深度清理、路径穿越防护、文件权限保留、选择性恢复、flock 并发锁。
   当用户想要备份、迁移、导出 Claude Code 配置和积累时使用。触发词包括但不限于：备份、迁移、backup、restore、migrate、搬家、换机器、一键迁移、导出配置、导入配置、备份我的配置、帮我打包、迁移到新机器、备份你的记忆技能、保存你的记忆、备份记忆。
   即使用户只是说"我要换机器了"或"帮我把这些东西保存下来"或"备份一下你的记忆和技能"，只要上下文暗示需要保存/迁移 Claude Code 的状态，都应该触发。
   不要用于普通的文件备份（用户只是想备份某个项目文件）、不要用于 git 操作（用户只是想 commit/push 代码）。
 ---
 
-# Claude Code 一键迁移 v3.0
+# Claude Code 一键迁移 v3.1
 
 本 Skill 将 Claude Code 的**全部积累**备份到一个 Git 仓库中，支持跨机器一键还原和定期远程推送。
+
+## v3.1 关键改进
+
+- **plans/ 备份**（full tier）：Agent 规划方案文档纳入备份，换机器后可查阅历史规划
+- **项目根 CLAUDE.md 发现增强**：同时扫描 `githubRepoPaths` 和 `projects` 字典键，覆盖非 GitHub 项目
+- **smart-merge 权限还原**：智能合并配置文件后也恢复原始权限
+- **stats 独立还原模块**：`--only stats` 单独还原使用统计，不与 config 混合
+- **manifest 精准检测**：`contents` 字段改为检测实际备份结果（staging 目录），而非检测源端
+- **.gitignore 按行匹配**：避免注释中的子串误匹配
+- **完整性校验失败退出**：restore 时校验失败默认中止，`--force` 可跳过
+- **--version 参数**：`python migrate.py --version` 快速确认版本号
 
 ## v3.0 关键改进
 
@@ -36,8 +48,10 @@ description: |
 | Agents | `~/.claude/agents/`（自定义 agents） | Y | Y |
 | Commands | `~/.claude/commands/`（自定义命令） | Y | Y |
 | 定时任务 | `~/.claude/scheduled_tasks.json` | Y | Y |
+| 使用统计 | `~/.claude/stats-cache.json` | Y | Y |
 | 项目级 Memory | `~/.claude/projects/*/CLAUDE.md` + 项目根目录的 CLAUDE.md | Y | Y |
 | 命令历史 | `~/.claude/history.jsonl` | - | Y |
+| 规划方案 | `~/.claude/plans/*.md`（Agent 规划文档） | - | Y |
 | Plugins | `~/.claude/plugins/` | - | Y |
 
 ## 核心脚本
@@ -81,7 +95,7 @@ python ~/.claude/skills/claude-migrate/scripts/migrate.py restore --conflict <ov
 python ~/.claude/skills/claude-migrate/scripts/migrate.py restore --conflict backup-existing --only skills memory config
 ```
 
-可选模块名：config, memory, skills, rules, agents, commands, scheduled_tasks, history, plugins, project_memories
+可选模块名：config, memory, skills, rules, agents, commands, scheduled_tasks, stats, plans, history, plugins, project_memories
 
 **智能合并**：settings.json 和 .claude.json 还原时自动检测 `__REDACTED__` 占位符，保留本机已有的敏感值，不会覆盖。
 

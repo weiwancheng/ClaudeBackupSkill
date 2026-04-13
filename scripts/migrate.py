@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """
-Claude Code 一键迁移工具 v3.0
+Claude Code 一键迁移工具 v3.1
 用法: python migrate.py <backup|restore|status|validate|init> [options]
 
 零外部依赖，仅需 Python 3.8+ 标准库 + git CLI。
+
+v3.1 改进:
+- plans/ 备份（full tier）：保留 Agent 规划方案文档
+- 项目根 CLAUDE.md 发现增强：同时扫描 projects 字典键和 githubRepoPaths
+- smart-merge 后还原文件权限
+- stats-cache 独立还原模块
+- manifest contents 改为检测实际备份结果
+- .gitignore 条目检测改为按行匹配
+- restore 完整性校验失败时默认退出（--force 跳过）
+- --version CLI 参数
 
 v3.0 改进:
 - 原子备份：先写临时目录再交换，避免中途失败导致仓库损坏
@@ -42,7 +52,8 @@ CLAUDE_HOME = Path.home() / ".claude"
 CLAUDE_JSON = Path.home() / ".claude.json"
 DEFAULT_REPO = Path.home() / ".claude-backup"
 REDACTED = "__REDACTED__"
-MANIFEST_VERSION = "3.0"
+SCRIPT_VERSION = "3.1"
+MANIFEST_VERSION = "3.1"
 
 # 敏感环境变量键名——白名单精确匹配（不再用正则）
 SENSITIVE_ENV_KEYS = frozenset({
@@ -91,22 +102,31 @@ CLAUDE_JSON_EPHEMERAL_KEYS = frozenset({
     "cachedStatsigGates", "metricsStatusCache", "firstStartTime",
 })
 
-# ~/.claude.json → projects 下每个项目需要清除的运行时字段
-CLAUDE_JSON_PROJECT_EPHEMERAL_KEYS = frozenset({
-    "lastSessionId", "lastCost", "lastTotalInputTokens",
-    "lastTotalOutputTokens", "lastSessionMetrics",
-    "exampleFilesGeneratedAt", "lastAccessTime",
-    "lastCommand", "sessionCount",
+# ~/.claude.json → projects 下每个项目**仅保留**的有意义字段（白名单策略）
+# 其余一切运行时指标（lastCost, lastSessionId, lastModelUsage, lastFps* 等）
+# 在新机器上毫无意义，自动剥离。白名单确保未来新增的 last* 字段也会被自动排除。
+CLAUDE_JSON_PROJECT_KEEP_KEYS = frozenset({
+    "allowedTools",
+    "mcpServers",
+    "mcpContextUris",
+    "enabledMcpjsonServers",
+    "disabledMcpjsonServers",
+    "hasTrustDialogAccepted",
+    "hasCompletedProjectOnboarding",
+    "projectOnboardingSeenCount",
+    "hasClaudeMdExternalIncludesApproved",
+    "hasClaudeMdExternalIncludesWarningShown",
+    "exampleFiles",
 })
 
 # 备份目录中需要保留的文件/目录（清理时不删除）
-REPO_PRESERVE_SET = frozenset({".git", ".gitignore", "README.md"})
+REPO_PRESERVE_SET = frozenset({".git", ".gitignore", "README.md", ".backup-staging", ".backup-old"})
 
 # restore --only 允许的模块名
 RESTORE_MODULES = frozenset({
     "config", "memory", "skills", "rules", "agents",
     "commands", "scheduled_tasks", "history", "plugins",
-    "project_memories",
+    "project_memories", "stats", "plans",
 })
 
 # 最小兼容的 manifest 版本
@@ -129,7 +149,7 @@ def run_git(args, cwd=None, check=True):
         stderr_msg = result.stderr.strip() if result.stderr else "(no stderr)"
         raise subprocess.CalledProcessError(
             result.returncode, cmd,
-            output=result.stdout, stderr=f"git {' '.join(args)}: {stderr_msg}"
+            output=result.stdout, stderr="git {}: {}".format(' '.join(args), stderr_msg)
         )
     return result
 
@@ -298,12 +318,13 @@ def sanitize_claude_json(data):
             sanitized[key] = REDACTED
             redacted_fields.append(".claude.json -> {}".format(key))
 
-    # 深度清理 projects 下的运行时字段
+    # 深度清理 projects：白名单策略，仅保留用户有意义的配置
     projects = sanitized.get("projects", {})
     for proj_key, proj_data in projects.items():
         if isinstance(proj_data, dict):
-            for ephemeral_key in CLAUDE_JSON_PROJECT_EPHEMERAL_KEYS:
-                proj_data.pop(ephemeral_key, None)
+            keys_to_remove = [k for k in proj_data if k not in CLAUDE_JSON_PROJECT_KEEP_KEYS]
+            for k in keys_to_remove:
+                del proj_data[k]
 
     return sanitized, redacted_fields
 
@@ -426,8 +447,9 @@ def find_project_claude_mds():
     # type: () -> List[Tuple[Path, str]]
     """
     发现所有项目根目录中的 CLAUDE.md 文件。
-    仅通过 ~/.claude.json 的 githubRepoPaths 可靠地找到项目路径。
-    不再使用不可靠的 mangled path 反编码。
+    通过两个来源发现项目路径：
+    1. ~/.claude.json 的 githubRepoPaths（GitHub 仓库路径映射）
+    2. ~/.claude.json 的 projects 字典键名（所有已注册项目路径）
     返回 [(文件路径, 项目标识), ...]
     """
     results = []  # type: List[Tuple[Path, str]]
@@ -440,7 +462,24 @@ def find_project_claude_mds():
     if data is None:
         return results
 
-    # 从 githubRepoPaths 提取（值可能是 string 或 list[string]）
+    def _scan_project_dir(project_dir, project_id):
+        # type: (Path, str) -> None
+        """扫描一个项目目录中的 CLAUDE.md"""
+        if not project_dir.exists() or not project_dir.is_dir():
+            return
+        # 安全检查：必须在 HOME 下
+        if not safe_path(project_dir, Path.home()):
+            return
+        for claude_md in [
+            project_dir / "CLAUDE.md",
+            project_dir / ".claude" / "CLAUDE.md",
+        ]:
+            path_str = str(claude_md)
+            if claude_md.exists() and path_str not in seen_paths:
+                results.append((claude_md, project_id))
+                seen_paths.add(path_str)
+
+    # 来源 1：从 githubRepoPaths 提取（值可能是 string 或 list[string]）
     repo_paths = data.get("githubRepoPaths", {})
     for repo_name, local_paths in repo_paths.items():
         if isinstance(local_paths, str):
@@ -448,20 +487,21 @@ def find_project_claude_mds():
         if not isinstance(local_paths, list):
             continue
         for local_path in local_paths:
-            project_dir = Path(local_path)
-            if not project_dir.exists():
-                continue
-            # 安全检查：必须在 HOME 下
-            if not safe_path(project_dir, Path.home()):
-                continue
-            for claude_md in [
-                project_dir / "CLAUDE.md",
-                project_dir / ".claude" / "CLAUDE.md",
-            ]:
-                path_str = str(claude_md)
-                if claude_md.exists() and path_str not in seen_paths:
-                    results.append((claude_md, repo_name))
-                    seen_paths.add(path_str)
+            _scan_project_dir(Path(local_path), repo_name)
+
+    # 来源 2：从 projects 字典键名提取（覆盖非 GitHub 项目）
+    projects = data.get("projects", {})
+    for proj_path_str in projects:
+        proj_path = Path(proj_path_str)
+        # 跳过 ~/.claude/ 下的路径（这些是 skill 开发目录，不是用户项目）
+        try:
+            proj_path.resolve().relative_to(CLAUDE_HOME.resolve())
+            continue  # skip paths inside ~/.claude/
+        except ValueError:
+            pass
+        # 用路径编码作为 project_id
+        safe_id = proj_path_str.replace("/", "-").replace("\\", "-").strip("-")
+        _scan_project_dir(proj_path, safe_id)
 
     return results
 
@@ -486,6 +526,39 @@ def record_permissions(directory):
             rel = str(item.relative_to(directory))
             perms[rel] = item.stat().st_mode & 0o777
     return perms
+
+
+# .gitignore 必须包含的条目
+GITIGNORE_REQUIRED_ENTRIES = [
+    "*.pre-restore",
+    "*.tmp",
+    "*.swp",
+    "*.swo",
+    ".DS_Store",
+    "Thumbs.db",
+    ".backup-staging/",
+    ".backup-old/",
+]
+
+
+def _ensure_gitignore_entries(repo):
+    # type: (Path) -> None
+    """确保 .gitignore 包含所有必要条目，不存在则创建，已存在则追加缺失项"""
+    gitignore = repo / ".gitignore"
+    if gitignore.exists():
+        with open(str(gitignore), "r", encoding="utf-8") as f:
+            existing_lines = set(line.strip() for line in f.read().splitlines())
+        missing = [e for e in GITIGNORE_REQUIRED_ENTRIES if e not in existing_lines]
+        if missing:
+            with open(str(gitignore), "a", encoding="utf-8") as f:
+                f.write("\n# auto-added by claude-migrate v3.1\n")
+                for entry in missing:
+                    f.write(entry + "\n")
+    else:
+        with open(str(gitignore), "w", encoding="utf-8") as f:
+            f.write("# Claude Code backup — auto-generated\n")
+            for entry in GITIGNORE_REQUIRED_ENTRIES:
+                f.write(entry + "\n")
 
 
 # ── init 命令 ──
@@ -529,35 +602,9 @@ def cmd_init(args):
             print_ok("已设置 git user.email: {}".format(args.git_email))
 
         # 写 .gitignore（改进版）
-        gitignore = repo / ".gitignore"
-        gitignore_content = (
-            "# 临时文件\n"
-            "*.pre-restore\n"
-            "*.tmp\n"
-            "*.swp\n"
-            "*.swo\n"
-            ".DS_Store\n"
-            "Thumbs.db\n"
-            ".backup-staging/\n"
-        )
-        if not gitignore.exists():
-            with open(str(gitignore), "w", encoding="utf-8") as f:
-                f.write(gitignore_content)
+        _ensure_gitignore_entries(repo)
+        if not (repo / ".gitignore").stat().st_size > 50:
             print_ok("已创建 .gitignore")
-        else:
-            # 检查并追加缺失条目
-            with open(str(gitignore), "r", encoding="utf-8") as f:
-                existing = f.read()
-            missing_lines = []
-            for line in gitignore_content.strip().split("\n"):
-                if line.startswith("#"):
-                    continue
-                if line.strip() and line.strip() not in existing:
-                    missing_lines.append(line)
-            if missing_lines:
-                with open(str(gitignore), "a", encoding="utf-8") as f:
-                    f.write("\n" + "\n".join(missing_lines) + "\n")
-                print_ok("已更新 .gitignore（+{} 条目）".format(len(missing_lines)))
 
         print()
         print_info("初始化完成。现在可以运行:")
@@ -588,7 +635,7 @@ def cmd_backup(args):
 
 def _do_backup(repo, tier, message, push):
     # type: (Path, str, Optional[str], bool) -> None
-    print_header("Claude Code 备份 (v3.0)")
+    print_header("Claude Code 备份 (v{})".format(SCRIPT_VERSION))
     print_info("备份层级: {}".format(tier))
     print_info("备份目标: {}".format(repo))
 
@@ -670,6 +717,13 @@ def _do_backup(repo, tier, message, push):
         "scheduled_tasks.json（定时任务）"
     )
 
+    # ─── 9b. stats-cache.json（使用统计）───
+    stats_src = CLAUDE_HOME / "stats-cache.json"
+    copy_file_if_exists(
+        stats_src, staging_dir / "stats-cache.json",
+        "stats-cache.json（使用统计）"
+    )
+
     # ─── 10. Skills ───
     skills_src = CLAUDE_HOME / "skills"
     skills_dst = staging_dir / "skills"
@@ -748,6 +802,22 @@ def _do_backup(repo, tier, message, push):
             "history.jsonl（命令历史）",
         )
 
+        # plans/（Agent 规划方案文档）
+        plans_src = CLAUDE_HOME / "plans"
+        if plans_src.exists() and any(plans_src.iterdir()):
+            plans_dst = staging_dir / "plans"
+            if plans_dst.exists():
+                shutil.rmtree(str(plans_dst))
+            # 只拷贝 .md 文件，跳过可能的临时文件
+            plans_dst.mkdir(parents=True, exist_ok=True)
+            plans_count = 0
+            for item in plans_src.iterdir():
+                if item.is_file() and item.suffix == ".md":
+                    shutil.copy2(str(item), str(plans_dst / item.name))
+                    plans_count += 1
+            if plans_count > 0:
+                print_ok("plans/ 已备份（{} 个规划文档）".format(plans_count))
+
         # plugins（排除 .git/node_modules）
         plugins_src = CLAUDE_HOME / "plugins"
         if plugins_src.exists():
@@ -786,18 +856,21 @@ def _do_backup(repo, tier, message, push):
         },
         "tier": tier,
         "contents": {
-            "claude_json": CLAUDE_JSON.exists(),
-            "settings_json": (CLAUDE_HOME / "settings.json").exists(),
-            "global_memory": (CLAUDE_HOME / "CLAUDE.md").exists(),
-            "rules": (CLAUDE_HOME / "rules").exists(),
-            "agents": (CLAUDE_HOME / "agents").exists(),
-            "commands": (CLAUDE_HOME / "commands").exists(),
-            "scheduled_tasks": (CLAUDE_HOME / "scheduled_tasks.json").exists(),
+            # 检测 staging 目录中实际存在的文件（而非源端）
+            "claude_json": (staging_dir / "claude.json").exists(),
+            "settings_json": (staging_dir / "settings.json").exists(),
+            "global_memory": (staging_dir / "CLAUDE.md").exists(),
+            "rules": (staging_dir / "rules").exists(),
+            "agents": (staging_dir / "agents").exists(),
+            "commands": (staging_dir / "commands").exists(),
+            "scheduled_tasks": (staging_dir / "scheduled_tasks.json").exists(),
+            "stats_cache": (staging_dir / "stats-cache.json").exists(),
             "skills": len(skills_manifest),
             "project_memories": project_memories_count,
             "project_root_memories": len(project_root_mds),
-            "history": tier == "full" and (CLAUDE_HOME / "history.jsonl").exists(),
-            "plugins": tier == "full" and (CLAUDE_HOME / "plugins").exists(),
+            "history": (staging_dir / "history.jsonl").exists(),
+            "plugins": (staging_dir / "plugins").exists(),
+            "plans": (staging_dir / "plans").exists(),
         },
         "skills": skills_manifest,
         "sanitized_fields": all_sanitized_fields,
@@ -810,35 +883,60 @@ def _do_backup(repo, tier, message, push):
     write_json_safe(manifest_path, manifest, "manifest.json")
     print_ok("manifest.json 已生成（含 {} 个文件哈希）".format(file_count))
 
-    # ─── 16. 原子交换：staging → repo ───
+    # ─── 16. 原子交换：staging → repo（三步 rename 策略）───
     print_info("正在执行原子交换...")
 
-    # 先删除 repo 中的旧内容（保留 .git / .gitignore / README.md）
-    for item in repo.iterdir():
-        if item.name in REPO_PRESERVE_SET or item.name == ".backup-staging":
-            continue
-        if item.is_dir():
-            shutil.rmtree(str(item))
-        else:
-            item.unlink()
+    # 确保 .gitignore 包含 staging 目录（防止崩溃后被 git add）
+    _ensure_gitignore_entries(repo)
 
-    # 将 staging 中的内容移入 repo
-    for item in staging_dir.iterdir():
-        dst = repo / item.name
-        if item.is_dir():
-            if dst.exists():
-                shutil.rmtree(str(dst))
-            shutil.move(str(item), str(dst))
-        else:
-            shutil.move(str(item), str(dst))
+    # 三步原子交换：
+    #   1) rename repo 中的旧内容到 .backup-old（保留 .git/.gitignore/README.md）
+    #   2) move staging 中的新文件到 repo
+    #   3) 成功后删除 .backup-old；失败则回滚
+    old_dir = repo / ".backup-old"
+    if old_dir.exists():
+        shutil.rmtree(str(old_dir))
+    old_dir.mkdir()
 
-    # 清理 staging 目录
+    # Step 1: 把旧内容移到 .backup-old
+    moved_items = []
+    try:
+        for item in list(repo.iterdir()):
+            if item.name in REPO_PRESERVE_SET or item.name in (".backup-staging", ".backup-old"):
+                continue
+            dst_old = old_dir / item.name
+            shutil.move(str(item), str(dst_old))
+            moved_items.append((dst_old, repo / item.name))
+
+        # Step 2: 把 staging 中的内容移入 repo
+        for item in list(staging_dir.iterdir()):
+            shutil.move(str(item), str(repo / item.name))
+
+    except (IOError, OSError, shutil.Error) as e:
+        # 回滚：把 .backup-old 中的内容移回 repo
+        print_fail("原子交换失败: {}，正在回滚...".format(e))
+        for old_item, original_pos in moved_items:
+            if old_item.exists() and not original_pos.exists():
+                try:
+                    shutil.move(str(old_item), str(original_pos))
+                except (IOError, OSError):
+                    pass
+        # 清理
+        if old_dir.exists():
+            shutil.rmtree(str(old_dir), ignore_errors=True)
+        if staging_dir.exists():
+            shutil.rmtree(str(staging_dir), ignore_errors=True)
+        raise
+
+    # Step 3: 成功，清理临时目录
+    if old_dir.exists():
+        shutil.rmtree(str(old_dir), ignore_errors=True)
     if staging_dir.exists():
-        shutil.rmtree(str(staging_dir))
+        shutil.rmtree(str(staging_dir), ignore_errors=True)
 
     print_ok("原子交换完成")
 
-    # ─── 17. Git commit ───
+    # ─── 17. Git commit（容错：commit 失败不影响已交换的文件）───
     run_git(["add", "-A"], cwd=repo)
 
     status_result = run_git(["status", "--porcelain"], cwd=repo)
@@ -847,8 +945,12 @@ def _do_backup(repo, tier, message, push):
     else:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         commit_msg = message or "Claude Code 备份 ({}) - {}".format(tier, timestamp)
-        run_git(["commit", "-m", commit_msg], cwd=repo)
-        print_ok("已提交: {}".format(commit_msg))
+        commit_result = run_git(["commit", "-m", commit_msg], cwd=repo, check=False)
+        if commit_result.returncode == 0:
+            print_ok("已提交: {}".format(commit_msg))
+        else:
+            stderr = commit_result.stderr.strip() if commit_result.stderr else "(未知)"
+            print_warn("git commit 失败（备份文件已就位，可手动提交）: {}".format(stderr))
 
     # ─── 18. 可选推送 ───
     if push:
@@ -907,6 +1009,7 @@ def cmd_restore(args):
     dry_run = args.dry_run
     conflict = args.conflict
     only_modules = set(args.only) if args.only else None
+    force = args.force
 
     # 获取文件锁
     lock_fd = None
@@ -914,14 +1017,14 @@ def cmd_restore(args):
         lock_fd = acquire_lock()
 
     try:
-        _do_restore(repo, dry_run, conflict, only_modules)
+        _do_restore(repo, dry_run, conflict, only_modules, force)
     finally:
         if lock_fd:
             release_lock(lock_fd)
 
 
-def _do_restore(repo, dry_run, conflict, only_modules):
-    # type: (Path, bool, str, Optional[Set[str]]) -> None
+def _do_restore(repo, dry_run, conflict, only_modules, force=False):
+    # type: (Path, bool, str, Optional[Set[str]], bool) -> None
     print_header("Claude Code 还原" + ("（DRY RUN）" if dry_run else ""))
 
     if not repo.exists():
@@ -976,8 +1079,11 @@ def _do_restore(repo, dry_run, conflict, only_modules):
             print_ok("完整性校验通过（{} 个文件）".format(checked))
         else:
             print_fail("部分文件完整性校验失败！建议重新 clone 备份仓库")
-            if not dry_run:
-                print_warn("继续还原可能导致问题，建议使用 --dry-run 先检查")
+            if not dry_run and not force:
+                print_fail("还原已中止。使用 --force 可强制跳过完整性检查")
+                sys.exit(1)
+            elif not dry_run and force:
+                print_warn("--force 模式：忽略完整性错误，继续还原")
     else:
         print_info("备份为 v2.0 格式，无完整性哈希（下次备份后将支持）")
 
@@ -1016,17 +1122,26 @@ def _do_restore(repo, dry_run, conflict, only_modules):
     if should_restore("config"):
         claude_json_src = repo / "claude.json"
         if claude_json_src.exists():
-            # 特殊标记：需要智能合并
-            actions.append(("smart-merge-claude-json", claude_json_src, CLAUDE_JSON,
-                            "[智能合并] .claude.json（保留本机敏感值）"))
+            if CLAUDE_JSON.exists() and conflict == "skip":
+                actions.append(("skip", claude_json_src, CLAUDE_JSON,
+                                "[跳过] .claude.json（已存在）"))
+            else:
+                # 智能合并：保留本机敏感值
+                actions.append(("smart-merge-claude-json", claude_json_src, CLAUDE_JSON,
+                                "[智能合并] .claude.json（保留本机敏感值）"))
 
     # 2. settings.json
     if should_restore("config"):
         settings_src = repo / "settings.json"
         if settings_src.exists():
-            # 特殊标记：需要智能合并
-            actions.append(("smart-merge-settings", settings_src, CLAUDE_HOME / "settings.json",
-                            "[智能合并] settings.json（保留本机敏感值）"))
+            dst = CLAUDE_HOME / "settings.json"
+            if dst.exists() and conflict == "skip":
+                actions.append(("skip", settings_src, dst,
+                                "[跳过] settings.json（已存在）"))
+            else:
+                # 智能合并：保留本机敏感值
+                actions.append(("smart-merge-settings", settings_src, dst,
+                                "[智能合并] settings.json（保留本机敏感值）"))
 
     # 3. 全局 CLAUDE.md
     if should_restore("memory"):
@@ -1059,6 +1174,15 @@ def _do_restore(repo, dry_run, conflict, only_modules):
             plan_file(
                 sched_src, CLAUDE_HOME / "scheduled_tasks.json",
                 "scheduled_tasks.json（定时任务）"
+            )
+
+    # 7b. stats-cache.json（独立 stats 模块）
+    if should_restore("stats"):
+        stats_src = repo / "stats-cache.json"
+        if stats_src.exists():
+            plan_file(
+                stats_src, CLAUDE_HOME / "stats-cache.json",
+                "stats-cache.json（使用统计）"
             )
 
     # 8. Skills
@@ -1160,6 +1284,12 @@ def _do_restore(repo, dry_run, conflict, only_modules):
         plugins_src = repo / "plugins"
         if plugins_src.exists():
             plan_dir(plugins_src, CLAUDE_HOME / "plugins", "plugins")
+
+    # 13. plans/（Agent 规划方案文档）
+    if should_restore("plans"):
+        plans_src = repo / "plans"
+        if plans_src.exists():
+            plan_dir(plans_src, CLAUDE_HOME / "plans", "plans")
 
     # 显示计划
     print_header("还原计划")
@@ -1289,9 +1419,16 @@ def _do_restore(repo, dry_run, conflict, only_modules):
                 continue
 
         # 还原文件权限（如果 manifest 中有记录）
-        if action_type in ("create", "overwrite", "backup-overwrite") and file_permissions_map:
+        if action_type in (
+            "create", "overwrite", "backup-overwrite",
+            "smart-merge-claude-json", "smart-merge-settings",
+        ) and file_permissions_map:
             try:
-                rel_path = str(src.relative_to(repo))
+                if action_type in ("smart-merge-claude-json", "smart-merge-settings"):
+                    # smart-merge 的 src 是备份仓库中的文件，用其相对路径查权限
+                    rel_path = str(src.relative_to(repo))
+                else:
+                    rel_path = str(src.relative_to(repo))
                 if rel_path in file_permissions_map:
                     os.chmod(str(dst), file_permissions_map[rel_path])
             except (ValueError, OSError):
@@ -1373,6 +1510,8 @@ def cmd_status(args):
                     items.append("history.jsonl")
                 if contents.get("plugins"):
                     items.append("plugins/")
+                if contents.get("plans"):
+                    items.append("plans/")
                 print_info("包含: {}".format(", ".join(items)))
 
             skills = manifest.get("skills", [])
@@ -1671,7 +1810,7 @@ def cmd_validate(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Claude Code 一键迁移工具 v3.0",
+        description="Claude Code 一键迁移工具 v{}".format(SCRIPT_VERSION),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -1685,6 +1824,11 @@ def main():
   %(prog)s status                                          # 查看备份状态
   %(prog)s validate                                        # 健康检查
         """,
+    )
+
+    parser.add_argument(
+        "--version", action="version",
+        version="claude-migrate v{}".format(SCRIPT_VERSION),
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1731,6 +1875,10 @@ def main():
     p_restore.add_argument(
         "--only", nargs="+", choices=sorted(RESTORE_MODULES),
         help="只还原指定模块（可选: {}）".format(", ".join(sorted(RESTORE_MODULES))),
+    )
+    p_restore.add_argument(
+        "--force", action="store_true", default=False,
+        help="完整性校验失败时强制继续还原",
     )
 
     # status
