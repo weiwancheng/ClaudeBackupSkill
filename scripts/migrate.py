@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
-Claude Code 一键迁移工具 v3.3
+Claude Code 一键迁移工具 v3.4
 用法: python migrate.py <backup|restore|status|validate|init> [options]
 
 零外部依赖，仅需 Python 3.8+ 标准库 + git CLI。
+跨平台支持：Windows / macOS / Linux。
+
+v3.4 改进:
+- 跨平台兼容：移除 fcntl 硬依赖，Windows 用 msvcrt，Unix 用 fcntl（条件导入）
+- symlink 安全回退：Windows 无权限时自动 fallback 为跟随 symlink 拷贝
+- 权限处理跨平台：Windows 上跳过 Unix 权限记录/还原（权限模型不兼容）
+- 用户名检测统一：改用 getpass.getuser() 替代环境变量探测
+- 跨平台路径还原：HOME 路径转换支持 Linux↔Windows 的路径分隔符差异
 
 v3.3 改进:
 - skill 备份智能过滤：跳过无 SKILL.md 的非 skill 目录（eval workspace 等不再被误备份）
@@ -36,7 +44,7 @@ v3.0 改进:
 import argparse
 import copy
 import datetime
-import fcntl
+import getpass
 import hashlib
 import json
 import os
@@ -55,8 +63,8 @@ CLAUDE_HOME = Path.home() / ".claude"
 CLAUDE_JSON = Path.home() / ".claude.json"
 DEFAULT_REPO = Path.home() / ".claude-backup"
 REDACTED = "__REDACTED__"
-SCRIPT_VERSION = "3.3"
-MANIFEST_VERSION = "3.3"
+SCRIPT_VERSION = "3.4"
+MANIFEST_VERSION = "3.4"
 
 # 敏感环境变量键名——白名单精确匹配（不再用正则）
 SENSITIVE_ENV_KEYS = frozenset({
@@ -230,10 +238,15 @@ def safe_path(target, base):
 
 def acquire_lock():
     # type: () -> object
-    """获取文件锁防止并发操作"""
+    """获取文件锁防止并发操作（跨平台：Unix 用 fcntl，Windows 用 msvcrt）"""
     lock_fd = open(str(LOCK_FILE), "w", encoding="utf-8")
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return lock_fd
     except (IOError, OSError):
         print_fail("另一个 migrate 实例正在运行，请等待完成后重试")
@@ -245,7 +258,15 @@ def release_lock(lock_fd):
     """释放文件锁"""
     if lock_fd:
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            if sys.platform == "win32":
+                import msvcrt
+                try:
+                    msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+                except (IOError, OSError):
+                    pass
+            else:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
         except (IOError, OSError):
             pass
@@ -420,16 +441,31 @@ def get_skill_info(skill_dir):
     return info
 
 
+def _copytree_safe(src, dst, ignore=None):
+    # type: (str, str, object) -> None
+    """跨平台 copytree：Unix 保留 symlink，Windows 自动 fallback 跟随 symlink"""
+    try:
+        shutil.copytree(src, dst, ignore=ignore, symlinks=True)
+    except OSError:
+        # Windows 无管理员权限时无法创建 symlink，改为跟随
+        if sys.platform == "win32":
+            if Path(dst).exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst, ignore=ignore, symlinks=False)
+        else:
+            raise
+
+
 def copy_skill_local(src, dst):
     # type: (Path, Path) -> None
-    """拷贝本地 skill，排除不需要的目录，不跟随 symlink"""
+    """拷贝本地 skill，排除不需要的目录"""
     if dst.exists():
         shutil.rmtree(str(dst))
 
     def ignore_func(directory, contents):
         return {item for item in contents if item in SKILL_EXCLUDE_DIRS}
 
-    shutil.copytree(str(src), str(dst), ignore=ignore_func, symlinks=True)
+    _copytree_safe(str(src), str(dst), ignore=ignore_func)
 
 
 def write_gitremote(skill_info, dest_dir):
@@ -449,11 +485,11 @@ def write_gitremote(skill_info, dest_dir):
 
 def copy_dir_if_exists(src, dst, label):
     # type: (Path, Path, str) -> bool
-    """如果源目录存在则拷贝（不跟随 symlink），返回是否拷贝了"""
+    """如果源目录存在则拷贝，返回是否拷贝了"""
     if src.exists() and any(src.iterdir()):
         if dst.exists():
             shutil.rmtree(str(dst))
-        shutil.copytree(str(src), str(dst), symlinks=True)
+        _copytree_safe(str(src), str(dst))
         print_ok("{} 已备份".format(label))
         return True
     return False
@@ -549,7 +585,9 @@ def compute_file_hashes(directory):
 
 def record_permissions(directory):
     # type: (Path) -> Dict[str, int]
-    """记录目录中所有文件的权限模式"""
+    """记录目录中所有文件的权限模式（Windows 上跳过，权限模型不兼容）"""
+    if sys.platform == "win32":
+        return {}
     perms = {}
     for item in sorted(directory.rglob("*")):
         if item.is_file() and ".git" not in item.parts:
@@ -869,9 +907,9 @@ def _do_backup(repo, tier, message, push):
                     if item in {".git", "node_modules", "__pycache__"}
                 }
 
-            shutil.copytree(
+            _copytree_safe(
                 str(plugins_src), str(plugins_dst),
-                ignore=plugins_ignore, symlinks=True
+                ignore=plugins_ignore
             )
             print_ok("plugins/ 已备份")
 
@@ -889,7 +927,7 @@ def _do_backup(repo, tier, message, push):
         "machine": {
             "hostname": platform.node(),
             "os": "{} {}".format(platform.system(), platform.release()),
-            "user": os.environ.get("USER", os.environ.get("USERNAME", "unknown")),
+            "user": getpass.getuser(),
             "home": str(Path.home()),
         },
         "tier": tier,
@@ -1308,11 +1346,13 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
                         continue
                     original_path = Path(original_path_str)
 
-                    # HOME 路径转换：备份来自不同用户时，替换 HOME 前缀
+                    # HOME 路径转换：备份来自不同用户/平台时，替换 HOME 前缀
                     backup_home = manifest.get("machine", {}).get("home", "")
                     current_home = str(Path.home())
                     if backup_home and backup_home != current_home and original_path_str.startswith(backup_home):
-                        original_path = Path(current_home + original_path_str[len(backup_home):])
+                        # 取出相对于 backup HOME 的部分，用当前 HOME 拼接（处理跨平台路径分隔符）
+                        relative_part = original_path_str[len(backup_home):].lstrip("/").lstrip("\\")
+                        original_path = Path.home() / Path(relative_part.replace("\\", "/"))
 
                     # 路径穿越防护：必须在 HOME 下
                     if not safe_path(original_path, Path.home()):
@@ -1501,12 +1541,14 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
             "smart-merge-claude-json", "smart-merge-settings",
         ) and file_permissions_map:
             try:
-                if action_type in ("smart-merge-claude-json", "smart-merge-settings"):
-                    # smart-merge 的 src 是备份仓库中的文件，用其相对路径查权限
-                    rel_path = str(src.relative_to(repo))
-                else:
-                    rel_path = str(src.relative_to(repo))
-                if rel_path in file_permissions_map:
+                if sys.platform != "win32":
+                    if action_type in ("smart-merge-claude-json", "smart-merge-settings"):
+                        # smart-merge 的 src 是备份仓库中的文件，用其相对路径查权限
+                        rel_path = str(src.relative_to(repo))
+                    else:
+                        rel_path = str(src.relative_to(repo))
+                    if rel_path in file_permissions_map:
+                        os.chmod(str(dst), file_permissions_map[rel_path])
                     os.chmod(str(dst), file_permissions_map[rel_path])
             except (ValueError, OSError):
                 pass

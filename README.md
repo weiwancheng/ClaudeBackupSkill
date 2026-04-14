@@ -1,6 +1,6 @@
 # claude-migrate
 
-Claude Code 一键备份/迁移 Skill（v3.3）。将 Claude Code 的全部积累备份到 Git 仓库，支持跨机器一键还原。
+Claude Code 一键备份/迁移 Skill（v3.4）。将 Claude Code 的全部积累备份到 Git 仓库，支持跨机器一键还原。跨平台支持 Windows / macOS / Linux。
 
 ## 解决什么问题
 
@@ -95,11 +95,13 @@ python3 ~/.claude/skills/claude-migrate/scripts/migrate.py validate
 
 - Python 3.8+（仅标准库，零外部依赖）
 - Git CLI
+- 支持平台：Windows / macOS / Linux
 
 ## 版本历史
 
 | 版本 | 变更 |
 |------|------|
+| v3.4 | 跨平台兼容（Windows/macOS/Linux）：条件导入文件锁、symlink 安全回退、权限处理跨平台、路径还原跨平台 |
 | v3.3 | skill 备份智能过滤（跳过无 SKILL.md 的目录）、description 精简 |
 | v3.2 | .claude.json 白名单过滤、BASE_URL 不再脱敏、原子交换回滚修复、跨用户 HOME 路径转换、git clone 锁定 commit、projects 深度合并 |
 | v3.1 | plans/ 备份、项目发现增强、stats 独立模块、完整性校验退出 |

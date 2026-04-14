@@ -10,9 +10,17 @@ metadata:
   author: weiwancheng
 ---
 
-# Claude Code 一键迁移 v3.3
+# Claude Code 一键迁移 v3.4
 
-本 Skill 将 Claude Code 的**全部积累**备份到一个 Git 仓库中，支持跨机器一键还原和定期远程推送。
+本 Skill 将 Claude Code 的**全部积累**备份到一个 Git 仓库中，支持跨机器一键还原和定期远程推送。跨平台支持 Windows / macOS / Linux。
+
+## v3.4 改进
+
+- **跨平台兼容**：移除 `fcntl` 硬依赖，Windows 用 `msvcrt`，Unix 用 `fcntl`（条件导入），脚本在 Windows 上不再崩溃
+- **symlink 安全回退**：Windows 无管理员权限时自动 fallback 为跟随 symlink 拷贝
+- **权限处理跨平台**：Windows 上跳过 Unix 权限记录/还原（权限模型不兼容，避免无意义数据）
+- **用户名检测统一**：改用 `getpass.getuser()` 替代环境变量探测，三平台行为一致
+- **跨平台路径还原**：HOME 路径转换支持 Linux↔Windows 的路径分隔符差异
 
 ## v3.3 改进
 
