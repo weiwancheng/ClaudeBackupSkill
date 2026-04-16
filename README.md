@@ -11,6 +11,8 @@ One command to backup. One command to restore. Zero dependencies.
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)]()
 
+[English](#-the-problem) · [中文](#-中文说明)
+
 </div>
 
 ---
@@ -221,23 +223,6 @@ Backward compatible: v3.x flat backups are auto-detected as Claude Code.
 
 ---
 
-## Requirements
-
-- Python 3.8+ (standard library only, zero `pip install`)
-- Git CLI
-
----
-
-<div align="center">
-
-**Your agent's mind deserves a backup plan.**
-
-[中文说明](#-中文说明) · MIT License · Made by [AlphaWill](https://github.com/AlphaWill0)
-
-</div>
-
----
-
 ## 🇨🇳 中文说明
 
 **agent-mind-migrate** — 多 AI Agent 统一迁移工具。
@@ -261,3 +246,20 @@ git clone https://github.com/AlphaWill0/agent-mind-migrate.git ~/.claude/skills/
 python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py restore --dry-run
 python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py restore --conflict backup-existing
 ```
+
+---
+
+## Requirements
+
+- Python 3.8+ (standard library only, zero `pip install`)
+- Git CLI
+
+---
+
+<div align="center">
+
+**Your agent's mind deserves a backup plan.**
+
+MIT License · Made by [AlphaWill](https://github.com/AlphaWill0)
+
+</div>
