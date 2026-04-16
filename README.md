@@ -1,112 +1,221 @@
-# claude-migrate
+<div align="center">
 
-Claude Code 一键备份/迁移 Skill（v3.4）。将 Claude Code 的全部积累备份到 Git 仓库，支持跨机器一键还原。跨平台支持 Windows / macOS / Linux。
+# 🧠 agent-mind-migrate
 
-## 解决什么问题
+**Migrate your AI agent's mind to a new machine — skills, memory, config, everything.**
 
-Claude Code 的使用积累分散在多个位置：skills、memory、settings、rules、agents、commands、定时任务等。换机器或重装后，这些积累全部丢失。
+One command to backup. One command to restore. Zero dependencies.
 
-`claude-migrate` 把它们打包成一个 Git 仓库，一键备份、一键还原。
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]()
 
-## 安装
+[English](#-what-it-does) · [中文](#-中文说明)
+
+</div>
+
+---
+
+## 💡 The Problem
+
+You've spent weeks teaching your AI agent. Custom skills, carefully tuned settings, accumulated memory, rules, commands, cron jobs. Then you switch machines — and it's all gone. Starting from scratch.
+
+**agent-mind-migrate** solves this. It backs up your AI agent's entire "mind" — everything that makes it *yours* — into a Git repo. Switch machines, restore in seconds.
+
+## 🤖 What It Does
+
+| Feature | Description |
+|---------|-------------|
+| **Multi-Agent** | Supports Claude Code, OpenClaw, Hermes — more coming |
+| **Auto-Discovery** | Detects which agents are installed, backs up all of them |
+| **One Command** | `backup --push` to save, `restore` to bring it back |
+| **Smart Redaction** | API keys and tokens are automatically replaced with `__REDACTED__` |
+| **Smart Restore** | Won't overwrite your existing secrets with placeholders |
+| **Atomic Writes** | Staging directory + three-step rename — crash-safe |
+| **Integrity Check** | SHA-256 hash for every file, verified on restore |
+| **Selective Restore** | Restore only skills, only memory, only one agent — your choice |
+| **Zero Dependencies** | Python 3.8+ standard library + Git CLI. That's it. |
+| **Cross-Platform** | Windows / macOS / Linux |
+
+## ⚡ Quick Start
+
+### Install
 
 ```bash
-# 方式 1：直接 clone 到 skills 目录
-git clone https://github.com/weiwancheng/ClaudeBackupSkill.git ~/.claude/skills/claude-migrate
-
-# 方式 2：已有 Claude Code 的话，安装后说"备份一下"即可触发
+# Clone into your Claude Code skills directory
+git clone https://github.com/AlphaWill0/agent-mind-migrate.git ~/.claude/skills/agent-mind-migrate
 ```
 
-## 快速开始
-
-### 首次配置
+### First-Time Setup
 
 ```bash
-# 配置远程仓库（用你自己的 GitHub 仓库 URL）
-python3 ~/.claude/skills/claude-migrate/scripts/migrate.py init --remote <your-git-url>
+# Point to your backup repo (create one first, e.g. agent-mind-backup)
+python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py init --remote <your-backup-repo-url>
 ```
 
-### 日常备份
+### Daily Backup
 
-在 Claude Code 对话中说：
+Just say to Claude Code:
 
 ```
 备份一下
 ```
 
-或手动执行：
+Or run manually:
 
 ```bash
-python3 ~/.claude/skills/claude-migrate/scripts/migrate.py backup --push
+python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py backup --push
 ```
 
-### 迁移到新机器
+### Migrate to a New Machine
 
 ```bash
-# 1. 新机器上 clone 备份仓库
+# On the new machine:
 git clone <your-backup-repo-url> ~/.claude-backup
-
-# 2. 预览还原
-python3 ~/.claude-backup/skills/claude-migrate/scripts/migrate.py restore --dry-run
-
-# 3. 执行还原
-python3 ~/.claude-backup/skills/claude-migrate/scripts/migrate.py restore --conflict backup-existing
-
-# 4. 健康检查
-python3 ~/.claude/skills/claude-migrate/scripts/migrate.py validate
+python3 ~/.claude-backup/claude-code/skills/agent-mind-migrate/scripts/migrate.py restore --dry-run
+# Review the output, then:
+python3 ~/.claude-backup/claude-code/skills/agent-mind-migrate/scripts/migrate.py restore --conflict backup-existing
 ```
 
-## 备份范围
+Done. Your agent remembers everything.
 
-| 内容 | essential | full |
-|------|:---------:|:----:|
-| `.claude.json`（项目授权、MCP 服务器） | Y | Y |
-| `settings.json`（环境变量、权限、hooks） | Y | Y |
-| 全局 CLAUDE.md（memory） | Y | Y |
-| Skills（所有已安装技能） | Y | Y |
-| Rules / Agents / Commands | Y | Y |
-| 定时任务、使用统计 | Y | Y |
-| 项目级 Memory | Y | Y |
-| 命令历史 | - | Y |
-| 规划方案（plans/） | - | Y |
-| Plugins | - | Y |
+## 📦 What Gets Backed Up
 
-## 五个命令
+### Claude Code (`~/.claude/`)
 
-| 命令 | 用途 |
-|------|------|
-| `init --remote <url>` | 初始化备份仓库并配置远程 |
-| `backup [--push]` | 备份当前配置（`--tier full` 完整备份） |
-| `restore --dry-run` | 预览还原操作 |
-| `restore --conflict backup-existing` | 执行还原（备份已有文件） |
-| `status` | 查看备份状态和差异 |
-| `validate` | 健康检查 |
+| Content | Essential | Full |
+|---------|:---------:|:----:|
+| Main config (`.claude.json`) | ✅ | ✅ |
+| Settings, environment variables | ✅ | ✅ |
+| Global memory (`CLAUDE.md`) | ✅ | ✅ |
+| All installed skills | ✅ | ✅ |
+| Rules, agents, commands | ✅ | ✅ |
+| Scheduled tasks, usage stats | ✅ | ✅ |
+| Project-level memory | ✅ | ✅ |
+| Command history | — | ✅ |
+| Plans, plugins | — | ✅ |
 
-## 安全机制
+### OpenClaw (`~/.openclaw/`)
 
-- **自动脱敏**：API key、token 等敏感值替换为 `__REDACTED__`，不进 Git
-- **智能合并还原**：检测到 `__REDACTED__` 时保留本机实际值，不覆盖
-- **原子备份**：staging 目录 + 三步 rename，中途失败自动回滚
-- **SHA-256 校验**：每个文件的哈希记录在 manifest.json 中
-- **路径穿越防护**：还原目标必须在 `$HOME` 下
-- **flock 并发锁**：防止多实例同时运行
+Config, bot settings, memory (SQLite), cron jobs, extensions, devices. Credentials excluded. Auth fields redacted.
 
-## 依赖
+### Hermes (`~/.hermes/`)
 
-- Python 3.8+（仅标准库，零外部依赖）
+Config, identity (SOUL.md), memories, skills, cron. Sensitive files (`.env`, `auth.json`) excluded.
+
+## 🗂️ Backup Structure
+
+Each agent gets its own directory — clean separation, no conflicts:
+
+```
+~/.claude-backup/
+├── manifest.json        # Which agents, when, integrity hashes
+├── claude-code/         # Claude Code backup
+│   ├── claude.json
+│   ├── skills/
+│   ├── CLAUDE.md
+│   └── ...
+├── openclaw/            # OpenClaw backup
+│   ├── openclaw.json
+│   └── ...
+└── hermes/              # Hermes backup
+    ├── config.yaml
+    └── ...
+```
+
+Backward compatible: v3.x backups (flat structure) are auto-detected as Claude Code.
+
+## 🔧 Commands
+
+| Command | What It Does |
+|---------|-------------|
+| `init --remote <url>` | Set up remote Git repo |
+| `backup [--push]` | Backup all detected agents |
+| `backup --agents claude-code` | Backup only specific agents |
+| `backup --tier full` | Include history, plans, plugins |
+| `restore --dry-run` | Preview what will be restored |
+| `restore --conflict backup-existing` | Restore (backup existing files first) |
+| `restore --agents openclaw` | Restore only one agent |
+| `restore --only skills memory` | Restore specific modules |
+| `status` | Show backup status per agent |
+| `validate` | Health check |
+
+## 🔒 Security
+
+- **Auto-redaction**: API keys, tokens, passwords → `__REDACTED__` before commit
+- **Smart merge**: On restore, if a field is `__REDACTED__` but your machine already has the real value, it keeps the real value
+- **Path traversal protection**: Restore targets must be under `$HOME`
+- **File lock**: Prevents concurrent backup/restore operations
+- **No secrets in Git**: Credentials directories are always excluded
+
+## 🌍 Supported Agents
+
+| Agent | Config Dir | Status |
+|-------|-----------|--------|
+| [Claude Code](https://claude.ai/claude-code) | `~/.claude/` | ✅ Full support |
+| [OpenClaw](https://github.com/openclaw) | `~/.openclaw/` | ✅ Full support |
+| [Hermes](https://github.com/NousResearch/hermes-agent) | `~/.hermes/` | ✅ Full support |
+
+The plugin architecture makes it easy to add more agents. PRs welcome!
+
+## 📋 Requirements
+
+- Python 3.8+ (standard library only, zero `pip install`)
 - Git CLI
-- 支持平台：Windows / macOS / Linux
+- Windows / macOS / Linux
 
-## 版本历史
+## 🇨🇳 中文说明
 
-| 版本 | 变更 |
-|------|------|
-| v3.4 | 跨平台兼容（Windows/macOS/Linux）：条件导入文件锁、symlink 安全回退、权限处理跨平台、路径还原跨平台 |
-| v3.3 | skill 备份智能过滤（跳过无 SKILL.md 的目录）、description 精简 |
-| v3.2 | .claude.json 白名单过滤、BASE_URL 不再脱敏、原子交换回滚修复、跨用户 HOME 路径转换、git clone 锁定 commit、projects 深度合并 |
-| v3.1 | plans/ 备份、项目发现增强、stats 独立模块、完整性校验退出 |
-| v3.0 | 原子备份、SHA-256 校验、智能合并、文件权限保留、选择性恢复 |
+**agent-mind-migrate** 是一个多 AI Agent 统一迁移工具。
+
+你花了几周调教 AI Agent——技能、记忆、设置、规则全都配好了。然后换台电脑，一切归零。
+
+这个工具把 Agent 的「心智」——技能、记忆、配置、规则、命令、定时任务——全部备份到 Git 仓库。换机器时一条命令还原，Agent 记住一切。
+
+### 支持的 Agent
+
+- **Claude Code** — 完整备份（配置、技能、记忆、规则、命令等）
+- **OpenClaw** — 完整备份（配置、Bot、记忆、插件、设备等）
+- **Hermes** — 完整备份（配置、身份、记忆、技能、定时任务）
+
+### 使用方式
+
+```bash
+# 安装
+git clone https://github.com/AlphaWill0/agent-mind-migrate.git ~/.claude/skills/agent-mind-migrate
+
+# 配置远程仓库
+python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py init --remote <你的仓库URL>
+
+# 备份（或直接对 Claude Code 说"备份一下"）
+python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py backup --push
+
+# 换机器还原
+git clone <备份仓库URL> ~/.claude-backup
+python3 ~/.claude-backup/claude-code/skills/agent-mind-migrate/scripts/migrate.py restore --conflict backup-existing
+```
+
+### 特色
+
+- 🔍 自动发现本机已安装的 Agent
+- 🔐 自动脱敏（token/密码 → `__REDACTED__`）
+- 🧠 智能合并还原（不覆盖本机已有的真实密钥）
+- ⚛️ 原子写入（中途失败自动回滚）
+- 🔢 SHA-256 完整性校验
+- 📦 零外部依赖（仅需 Python 3.8+ 和 Git）
+
+---
 
 ## License
 
 MIT
+
+---
+
+<div align="center">
+
+**Your agent's mind deserves a backup plan.**
+
+Made with ❤️ by [AlphaWill](https://github.com/AlphaWill0)
+
+</div>

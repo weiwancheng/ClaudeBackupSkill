@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-Claude Code 一键迁移工具 v3.4
+Agent Migrate v4.0 — 多 Agent 统一备份/迁移工具
 用法: python migrate.py <backup|restore|status|validate|init> [options]
 
+支持 Agent: Claude Code, OpenClaw, Hermes
 零外部依赖，仅需 Python 3.8+ 标准库 + git CLI。
 跨平台支持：Windows / macOS / Linux。
+
+v4.0 改进:
+- 插件架构：AgentPlugin 基类 + ClaudeCode/OpenClaw/Hermes 三个插件
+- 自动发现已安装的 Agent，按 Agent 独立存储（repo/<agent-name>/）
+- --agents 参数过滤指定 Agent
+- 向后兼容 v3.x 格式（无 agents 字段时按 Claude Code 处理）
 
 v3.4 改进:
 - 跨平台兼容：移除 fcntl 硬依赖，Windows 用 msvcrt，Unix 用 fcntl（条件导入）
@@ -12,33 +19,6 @@ v3.4 改进:
 - 权限处理跨平台：Windows 上跳过 Unix 权限记录/还原（权限模型不兼容）
 - 用户名检测统一：改用 getpass.getuser() 替代环境变量探测
 - 跨平台路径还原：HOME 路径转换支持 Linux↔Windows 的路径分隔符差异
-
-v3.3 改进:
-- skill 备份智能过滤：跳过无 SKILL.md 的非 skill 目录（eval workspace 等不再被误备份）
-- SKILL.md description 精简：变更日志从触发描述移至 body，提升触发精度
-
-v3.2 改进:
-- .claude.json 顶层字段改为白名单策略（仅保留 projects/skillUsage/githubRepoPaths 等有意义字段）
-- BASE_URL 类地址不再脱敏（减少还原摩擦）
-- 原子交换回滚完整性修复（Step 2 失败时清理已移入 repo 的文件）
-- 还原时 HOME 路径自动转换（支持跨用户迁移）
-- git clone 还原锁定到备份时的 commit SHA
-- smart_merge 支持 projects 深度合并（保留新机器已有的授权信息）
-- 清理死代码 + gitignore 检查逻辑修复
-
-v3.0 改进:
-- 原子备份：先写临时目录再交换，避免中途失败导致仓库损坏
-- SHA-256 文件哈希完整性校验
-- 智能合并还原：不会将 __REDACTED__ 写入实际配置
-- claude.json 深度隐私清理（session/cost/token 等运行时数据）
-- 路径穿越防护
-- 文件权限保留
-- encoding="utf-8" 全覆盖
-- symlink 安全处理
-- flock 并发保护
-- 敏感键白名单机制（取代正则匹配）
-- 选择性恢复 --only
-- manifest 版本兼容
 """
 
 import argparse
@@ -61,10 +41,12 @@ from typing import Dict, List, Optional, Set, Tuple
 
 CLAUDE_HOME = Path.home() / ".claude"
 CLAUDE_JSON = Path.home() / ".claude.json"
+OPENCLAW_HOME = Path.home() / ".openclaw"
+HERMES_HOME = Path.home() / ".hermes"
 DEFAULT_REPO = Path.home() / ".claude-backup"
 REDACTED = "__REDACTED__"
-SCRIPT_VERSION = "3.4"
-MANIFEST_VERSION = "3.4"
+SCRIPT_VERSION = "4.0"
+MANIFEST_VERSION = "4.0"
 
 # 敏感环境变量键名——白名单精确匹配（不再用正则）
 SENSITIVE_ENV_KEYS = frozenset({
@@ -152,7 +134,32 @@ RESTORE_MODULES = frozenset({
 # 最小兼容的 manifest 版本
 MIN_COMPATIBLE_VERSION = "2.0"
 
-LOCK_FILE = Path(tempfile.gettempdir()) / "claude-migrate.lock"
+LOCK_FILE = Path(tempfile.gettempdir()) / "agent-migrate.lock"
+
+
+# ── Agent Plugin 架构 ──
+
+class AgentPlugin:
+    """Agent 备份插件基类"""
+    name = ""           # e.g. "claude-code"
+    display_name = ""   # e.g. "Claude Code"
+    config_dir = None   # Path, e.g. CLAUDE_HOME
+
+    def discover(self):
+        """检测该 Agent 是否已安装"""
+        return self.config_dir is not None and self.config_dir.exists()
+
+    def backup(self, staging, tier):
+        """备份到 staging 目录，返回 (sanitized_fields, skills_manifest)"""
+        raise NotImplementedError
+
+    def restore(self, source, dry_run, conflict, only_modules, actions_list):
+        """规划还原动作，追加到 actions_list"""
+        raise NotImplementedError
+
+    def status(self, agent_dir):
+        """返回状态信息 dict"""
+        raise NotImplementedError
 
 
 # ── 工具函数 ──
@@ -619,14 +626,688 @@ def _ensure_gitignore_entries(repo):
         missing = [e for e in GITIGNORE_REQUIRED_ENTRIES if e not in existing_lines]
         if missing:
             with open(str(gitignore), "a", encoding="utf-8") as f:
-                f.write("\n# auto-added by claude-migrate v3.1\n")
+                f.write("\n# auto-added by agent-migrate v4.0\n")
                 for entry in missing:
                     f.write(entry + "\n")
     else:
         with open(str(gitignore), "w", encoding="utf-8") as f:
-            f.write("# Claude Code backup — auto-generated\n")
+            f.write("# Agent Migrate backup — auto-generated\n")
             for entry in GITIGNORE_REQUIRED_ENTRIES:
                 f.write(entry + "\n")
+
+
+# ── Agent Plugin 实现 ──
+
+class ClaudeCodePlugin(AgentPlugin):
+    """Claude Code 备份插件"""
+    name = "claude-code"
+    display_name = "Claude Code"
+    config_dir = CLAUDE_HOME
+
+    def backup(self, staging, tier):
+        # type: (Path, str) -> Tuple[List[str], List[dict]]
+        all_sanitized_fields = []  # type: List[str]
+        skills_manifest = []  # type: List[dict]
+
+        # 1. ~/.claude.json（主配置文件）
+        if CLAUDE_JSON.exists():
+            claude_json_data = read_json_safe(CLAUDE_JSON, ".claude.json")
+            if claude_json_data is not None:
+                sanitized_data, fields = sanitize_claude_json(claude_json_data)
+                all_sanitized_fields.extend(fields)
+                if write_json_safe(staging / "claude.json", sanitized_data, ".claude.json"):
+                    projects = sanitized_data.get("projects", {})
+                    skill_usage = sanitized_data.get("skillUsage", {})
+                    print_ok(".claude.json 已备份（{} 个项目配置, {} 条 skill 使用记录）".format(
+                        len(projects), len(skill_usage)
+                    ))
+                    if fields:
+                        print_info("  脱敏: {}".format(", ".join(fields)))
+        else:
+            print_info("无 ~/.claude.json，跳过")
+
+        # 2. settings.json（脱敏）
+        settings_src = CLAUDE_HOME / "settings.json"
+        if settings_src.exists():
+            settings_data = read_json_safe(settings_src, "settings.json")
+            if settings_data is not None:
+                sanitized_data, fields = sanitize_settings(settings_data)
+                all_sanitized_fields.extend(fields)
+                if write_json_safe(staging / "settings.json", sanitized_data, "settings.json"):
+                    msg = "settings.json 已备份"
+                    if fields:
+                        msg += "（脱敏: {}）".format(", ".join(fields))
+                    print_ok(msg)
+        else:
+            print_warn("settings.json 不存在，跳过")
+
+        # 3. 全局 CLAUDE.md
+        global_memory = CLAUDE_HOME / "CLAUDE.md"
+        if global_memory.exists() and not global_memory.is_symlink():
+            shutil.copy2(str(global_memory), str(staging / "CLAUDE.md"))
+            print_ok("CLAUDE.md（全局 memory）已备份")
+        elif global_memory.is_symlink():
+            print_warn("全局 CLAUDE.md 是符号链接，跳过")
+        else:
+            print_info("无全局 CLAUDE.md，跳过")
+
+        # 4. rules/
+        rules_src = CLAUDE_HOME / "rules"
+        copy_dir_if_exists(rules_src, staging / "rules", "rules/（用户规则）")
+
+        # 5. agents/
+        agents_src = CLAUDE_HOME / "agents"
+        copy_dir_if_exists(agents_src, staging / "agents", "agents/（自定义 agents）")
+
+        # 6. commands/
+        commands_src = CLAUDE_HOME / "commands"
+        copy_dir_if_exists(commands_src, staging / "commands", "commands/（自定义命令）")
+
+        # 7. scheduled_tasks.json
+        scheduled_src = CLAUDE_HOME / "scheduled_tasks.json"
+        copy_file_if_exists(
+            scheduled_src, staging / "scheduled_tasks.json",
+            "scheduled_tasks.json（定时任务）"
+        )
+
+        # 8. stats-cache.json（使用统计）
+        stats_src = CLAUDE_HOME / "stats-cache.json"
+        copy_file_if_exists(
+            stats_src, staging / "stats-cache.json",
+            "stats-cache.json（使用统计）"
+        )
+
+        # 9. Skills
+        skills_src = CLAUDE_HOME / "skills"
+        skills_dst = staging / "skills"
+        skills_dst.mkdir(parents=True, exist_ok=True)
+
+        if skills_src.exists():
+            for skill_dir in sorted(skills_src.iterdir()):
+                if not skill_dir.is_dir():
+                    continue
+
+                has_skill_md = (skill_dir / "SKILL.md").exists()
+                if not has_skill_md and skill_dir.name not in SKILL_EXCLUDE_TOPLEVEL:
+                    found = list(skill_dir.rglob("SKILL.md"))
+                    if not found:
+                        print_info("跳过非 skill 目录: {}".format(skill_dir.name))
+                        continue
+
+                info = get_skill_info(skill_dir)
+                skills_manifest.append(info)
+
+                if info["type"] == "git":
+                    write_gitremote(info, skills_dst)
+                    print_ok("skill [{}] -> .gitremote（{}）".format(
+                        info["name"], info["remote"]
+                    ))
+                else:
+                    copy_skill_local(skill_dir, skills_dst / info["name"])
+                    print_ok("skill [{}] -> 完整拷贝".format(info["name"]))
+        else:
+            print_warn("skills/ 目录不存在")
+
+        # 10. 项目级 CLAUDE.md（~/.claude/projects/ 内）
+        projects_src = CLAUDE_HOME / "projects"
+        projects_dst = staging / "projects"
+        project_memories_count = 0
+
+        if projects_src.exists():
+            for project_dir in projects_src.iterdir():
+                if not project_dir.is_dir():
+                    continue
+                for memory_file in [
+                    project_dir / "CLAUDE.md",
+                    project_dir / "memory" / "CLAUDE.md",
+                ]:
+                    if memory_file.exists() and not memory_file.is_symlink():
+                        dst_dir = projects_dst / project_dir.name
+                        dst_dir.mkdir(parents=True, exist_ok=True)
+                        rel = memory_file.relative_to(project_dir)
+                        dst_file = dst_dir / rel
+                        dst_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(memory_file), str(dst_file))
+                        project_memories_count += 1
+
+        # 11. 项目根目录的 CLAUDE.md
+        project_root_mds = find_project_claude_mds()
+        for claude_md_path, project_id in project_root_mds:
+            if not safe_path(claude_md_path, Path.home()):
+                print_warn("跳过不安全路径: {}".format(claude_md_path))
+                continue
+
+            safe_id = project_id.replace("/", "-").replace("\\", "-").strip("-")
+            dst_dir = staging / "project-root-memories" / safe_id
+            dst_dir.mkdir(parents=True, exist_ok=True)
+
+            shutil.copy2(str(claude_md_path), str(dst_dir / "CLAUDE.md"))
+            with open(str(dst_dir / ".source_path"), "w", encoding="utf-8") as f:
+                f.write(str(claude_md_path) + "\n")
+            project_memories_count += 1
+
+        if project_memories_count > 0:
+            print_ok("项目级 memory: {} 个已备份".format(project_memories_count))
+        else:
+            print_info("无项目级 CLAUDE.md")
+
+        # 12. full tier 额外内容
+        if tier == "full":
+            copy_file_if_exists(
+                CLAUDE_HOME / "history.jsonl",
+                staging / "history.jsonl",
+                "history.jsonl（命令历史）",
+            )
+
+            plans_src = CLAUDE_HOME / "plans"
+            if plans_src.exists() and any(plans_src.iterdir()):
+                plans_dst = staging / "plans"
+                if plans_dst.exists():
+                    shutil.rmtree(str(plans_dst))
+                plans_dst.mkdir(parents=True, exist_ok=True)
+                plans_count = 0
+                for item in plans_src.iterdir():
+                    if item.is_file() and item.suffix == ".md":
+                        shutil.copy2(str(item), str(plans_dst / item.name))
+                        plans_count += 1
+                if plans_count > 0:
+                    print_ok("plans/ 已备份（{} 个规划文档）".format(plans_count))
+
+            plugins_src = CLAUDE_HOME / "plugins"
+            if plugins_src.exists():
+                plugins_dst = staging / "plugins"
+                if plugins_dst.exists():
+                    shutil.rmtree(str(plugins_dst))
+
+                def plugins_ignore(directory, contents):
+                    return {
+                        item for item in contents
+                        if item in {".git", "node_modules", "__pycache__"}
+                    }
+
+                _copytree_safe(
+                    str(plugins_src), str(plugins_dst),
+                    ignore=plugins_ignore
+                )
+                print_ok("plugins/ 已备份")
+
+        return all_sanitized_fields, skills_manifest
+
+    def restore(self, source, dry_run, conflict, only_modules, actions_list):
+        # type: (Path, bool, str, Optional[Set[str]], List) -> None
+        """规划 Claude Code 还原动作"""
+
+        def should_restore(module_name):
+            if only_modules is None:
+                return True
+            return module_name in only_modules
+
+        def plan_file(src, dst, desc):
+            if dst.exists():
+                if conflict == "skip":
+                    actions_list.append(("skip", src, dst, "[跳过] {}（已存在）".format(desc)))
+                elif conflict == "overwrite":
+                    actions_list.append(("overwrite", src, dst, "[覆盖] {}".format(desc)))
+                elif conflict == "backup-existing":
+                    actions_list.append(("backup-overwrite", src, dst, "[备份+覆盖] {}".format(desc)))
+            else:
+                actions_list.append(("create", src, dst, "[新建] {}".format(desc)))
+
+        def plan_dir(src, dst, desc):
+            if not src.exists():
+                return
+            for item in src.rglob("*"):
+                if item.is_file():
+                    rel = item.relative_to(src)
+                    plan_file(item, dst / rel, "{}/{}".format(desc, rel))
+
+        # 1. claude.json -> ~/.claude.json
+        if should_restore("config"):
+            claude_json_src = source / "claude.json"
+            if claude_json_src.exists():
+                if CLAUDE_JSON.exists() and conflict == "skip":
+                    actions_list.append(("skip", claude_json_src, CLAUDE_JSON,
+                                    "[跳过] .claude.json（已存在）"))
+                else:
+                    actions_list.append(("smart-merge-claude-json", claude_json_src, CLAUDE_JSON,
+                                    "[智能合并] .claude.json（保留本机敏感值）"))
+
+        # 2. settings.json
+        if should_restore("config"):
+            settings_src = source / "settings.json"
+            if settings_src.exists():
+                dst = CLAUDE_HOME / "settings.json"
+                if dst.exists() and conflict == "skip":
+                    actions_list.append(("skip", settings_src, dst,
+                                    "[跳过] settings.json（已存在）"))
+                else:
+                    actions_list.append(("smart-merge-settings", settings_src, dst,
+                                    "[智能合并] settings.json（保留本机敏感值）"))
+
+        # 3. 全局 CLAUDE.md
+        if should_restore("memory"):
+            memory_src = source / "CLAUDE.md"
+            if memory_src.exists():
+                plan_file(memory_src, CLAUDE_HOME / "CLAUDE.md", "CLAUDE.md（全局 memory）")
+
+        # 4. rules/
+        if should_restore("rules"):
+            rules_src = source / "rules"
+            if rules_src.exists():
+                plan_dir(rules_src, CLAUDE_HOME / "rules", "rules")
+
+        # 5. agents/
+        if should_restore("agents"):
+            agents_src = source / "agents"
+            if agents_src.exists():
+                plan_dir(agents_src, CLAUDE_HOME / "agents", "agents")
+
+        # 6. commands/
+        if should_restore("commands"):
+            commands_src = source / "commands"
+            if commands_src.exists():
+                plan_dir(commands_src, CLAUDE_HOME / "commands", "commands")
+
+        # 7. scheduled_tasks.json
+        if should_restore("scheduled_tasks"):
+            sched_src = source / "scheduled_tasks.json"
+            if sched_src.exists():
+                plan_file(
+                    sched_src, CLAUDE_HOME / "scheduled_tasks.json",
+                    "scheduled_tasks.json（定时任务）"
+                )
+
+        # 8. stats-cache.json
+        if should_restore("stats"):
+            stats_src = source / "stats-cache.json"
+            if stats_src.exists():
+                plan_file(
+                    stats_src, CLAUDE_HOME / "stats-cache.json",
+                    "stats-cache.json（使用统计）"
+                )
+
+        # 9. Skills
+        if should_restore("skills"):
+            skills_src = source / "skills"
+            if skills_src.exists():
+                for item in sorted(skills_src.iterdir()):
+                    if item.is_dir():
+                        plan_dir(
+                            item, CLAUDE_HOME / "skills" / item.name,
+                            "skill/{}".format(item.name)
+                        )
+                    elif item.suffix == ".gitremote":
+                        gitinfo = read_json_safe(item, item.name)
+                        if gitinfo is None:
+                            continue
+                        skill_name = gitinfo.get("name", item.stem)
+                        dst = CLAUDE_HOME / "skills" / skill_name
+                        if dst.exists():
+                            if conflict == "skip":
+                                actions_list.append((
+                                    "skip", item, dst,
+                                    "[跳过] skill/{}（git, 已存在）".format(skill_name)
+                                ))
+                            elif conflict == "overwrite":
+                                actions_list.append((
+                                    "git-clone", item, dst,
+                                    "[重新 clone] skill/{} <- {}".format(
+                                        skill_name, gitinfo.get("remote", "?")
+                                    )
+                                ))
+                            elif conflict == "backup-existing":
+                                actions_list.append((
+                                    "git-clone-backup", item, dst,
+                                    "[备份+clone] skill/{} <- {}".format(
+                                        skill_name, gitinfo.get("remote", "?")
+                                    )
+                                ))
+                        else:
+                            actions_list.append((
+                                "git-clone", item, dst,
+                                "[clone] skill/{} <- {}".format(
+                                    skill_name, gitinfo.get("remote", "?")
+                                )
+                            ))
+
+        # 10. 项目级 memory
+        if should_restore("project_memories"):
+            projects_src = source / "projects"
+            if projects_src.exists():
+                for project_dir in projects_src.iterdir():
+                    if project_dir.is_dir():
+                        plan_dir(
+                            project_dir,
+                            CLAUDE_HOME / "projects" / project_dir.name,
+                            "project-memory/{}".format(project_dir.name),
+                        )
+
+        # 11. 项目根目录 CLAUDE.md（需要 manifest 中的 home 信息来做路径转换）
+        if should_restore("project_memories"):
+            project_root_src = source / "project-root-memories"
+            if project_root_src.exists():
+                for project_dir in project_root_src.iterdir():
+                    if not project_dir.is_dir():
+                        continue
+                    source_path_file = project_dir / ".source_path"
+                    if source_path_file.exists():
+                        try:
+                            with open(str(source_path_file), "r", encoding="utf-8") as f:
+                                original_path_str = f.read().strip()
+                        except (IOError, OSError):
+                            continue
+                        original_path = Path(original_path_str)
+
+                        # 路径穿越防护
+                        if not safe_path(original_path, Path.home()):
+                            print_warn(
+                                "跳过不安全的还原路径: {} (不在 HOME 目录下)".format(
+                                    original_path
+                                )
+                            )
+                            continue
+
+                        claude_md = project_dir / "CLAUDE.md"
+                        if claude_md.exists():
+                            plan_file(
+                                claude_md, original_path,
+                                "项目 CLAUDE.md -> {}".format(original_path)
+                            )
+
+        # 12. history.jsonl
+        if should_restore("history"):
+            history_src = source / "history.jsonl"
+            if history_src.exists():
+                plan_file(history_src, CLAUDE_HOME / "history.jsonl", "history.jsonl")
+
+        # 13. plugins
+        if should_restore("plugins"):
+            plugins_src = source / "plugins"
+            if plugins_src.exists():
+                plan_dir(plugins_src, CLAUDE_HOME / "plugins", "plugins")
+
+        # 14. plans/
+        if should_restore("plans"):
+            plans_src = source / "plans"
+            if plans_src.exists():
+                plan_dir(plans_src, CLAUDE_HOME / "plans", "plans")
+
+    def status(self, agent_dir):
+        # type: (Path) -> dict
+        """返回 Claude Code 状态信息"""
+        info = {"name": self.display_name, "installed": self.discover()}
+        if agent_dir.exists():
+            info["backed_up"] = True
+            # Count files
+            file_count = sum(1 for _ in agent_dir.rglob("*") if _.is_file())
+            info["file_count"] = file_count
+        else:
+            info["backed_up"] = False
+        return info
+
+
+class OpenClawPlugin(AgentPlugin):
+    """OpenClaw 备份插件"""
+    name = "openclaw"
+    display_name = "OpenClaw"
+    config_dir = OPENCLAW_HOME
+
+    def _sanitize_openclaw_json(self, data):
+        # type: (dict) -> Tuple[dict, List[str]]
+        """对 openclaw.json 脱敏：auth 下所有叶子字符串替换为 __REDACTED__"""
+        sanitized = copy.deepcopy(data)
+        redacted_fields = []
+
+        def _redact_leaves(obj, path):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    current_path = "{}.{}".format(path, k)
+                    if isinstance(v, str) and v:
+                        obj[k] = REDACTED
+                        redacted_fields.append("openclaw.json -> {}".format(current_path))
+                    elif isinstance(v, (dict, list)):
+                        _redact_leaves(v, current_path)
+            elif isinstance(obj, list):
+                for i, v in enumerate(obj):
+                    if isinstance(v, str) and v:
+                        obj[i] = REDACTED
+                    elif isinstance(v, (dict, list)):
+                        _redact_leaves(v, "{}[{}]".format(path, i))
+
+        auth = sanitized.get("auth")
+        if auth is not None:
+            _redact_leaves(auth, "auth")
+
+        return sanitized, redacted_fields
+
+    def backup(self, staging, tier):
+        # type: (Path, str) -> Tuple[List[str], List[dict]]
+        all_sanitized_fields = []  # type: List[str]
+
+        oc = OPENCLAW_HOME
+
+        # openclaw.json（脱敏 auth）
+        oc_json = oc / "openclaw.json"
+        if oc_json.exists():
+            data = read_json_safe(oc_json, "openclaw.json")
+            if data is not None:
+                sanitized_data, fields = self._sanitize_openclaw_json(data)
+                all_sanitized_fields.extend(fields)
+                if write_json_safe(staging / "openclaw.json", sanitized_data, "openclaw.json"):
+                    msg = "openclaw.json 已备份"
+                    if fields:
+                        msg += "（脱敏: {} 个字段）".format(len(fields))
+                    print_ok(msg)
+
+        # clawdbot.json
+        copy_file_if_exists(oc / "clawdbot.json", staging / "clawdbot.json", "clawdbot.json")
+
+        # memory/main.sqlite
+        sqlite_src = oc / "memory" / "main.sqlite"
+        if sqlite_src.exists():
+            dst = staging / "memory" / "main.sqlite"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(sqlite_src), str(dst))
+            print_ok("memory/main.sqlite 已备份")
+
+        # cron/jobs.json
+        cron_src = oc / "cron" / "jobs.json"
+        if cron_src.exists():
+            dst = staging / "cron" / "jobs.json"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(cron_src), str(dst))
+            print_ok("cron/jobs.json 已备份")
+
+        # extensions/（跳过 node_modules）
+        extensions_src = oc / "extensions"
+        if extensions_src.exists() and any(extensions_src.iterdir()):
+            ext_dst = staging / "extensions"
+            if ext_dst.exists():
+                shutil.rmtree(str(ext_dst))
+
+            def ext_ignore(directory, contents):
+                return {item for item in contents if item == "node_modules"}
+
+            _copytree_safe(str(extensions_src), str(ext_dst), ignore=ext_ignore)
+            print_ok("extensions/ 已备份")
+
+        # devices/
+        copy_dir_if_exists(oc / "devices", staging / "devices", "devices/")
+
+        return all_sanitized_fields, []
+
+    def restore(self, source, dry_run, conflict, only_modules, actions_list):
+        # type: (Path, bool, str, Optional[Set[str]], List) -> None
+
+        def plan_file(src, dst, desc):
+            if dst.exists():
+                if conflict == "skip":
+                    actions_list.append(("skip", src, dst, "[跳过] {}（已存在）".format(desc)))
+                elif conflict == "overwrite":
+                    actions_list.append(("overwrite", src, dst, "[覆盖] {}".format(desc)))
+                elif conflict == "backup-existing":
+                    actions_list.append(("backup-overwrite", src, dst, "[备份+覆盖] {}".format(desc)))
+            else:
+                actions_list.append(("create", src, dst, "[新建] {}".format(desc)))
+
+        def plan_dir(src, dst, desc):
+            if not src.exists():
+                return
+            for item in src.rglob("*"):
+                if item.is_file():
+                    rel = item.relative_to(src)
+                    plan_file(item, dst / rel, "{}/{}".format(desc, rel))
+
+        oc = OPENCLAW_HOME
+
+        # openclaw.json（智能合并）
+        oc_json_src = source / "openclaw.json"
+        if oc_json_src.exists():
+            if (oc / "openclaw.json").exists() and conflict == "skip":
+                actions_list.append(("skip", oc_json_src, oc / "openclaw.json",
+                                "[跳过] openclaw.json（已存在）"))
+            else:
+                actions_list.append(("smart-merge-openclaw-json", oc_json_src, oc / "openclaw.json",
+                                "[智能合并] openclaw.json（保留本机 auth）"))
+
+        # clawdbot.json
+        src = source / "clawdbot.json"
+        if src.exists():
+            plan_file(src, oc / "clawdbot.json", "clawdbot.json")
+
+        # memory/main.sqlite
+        src = source / "memory" / "main.sqlite"
+        if src.exists():
+            plan_file(src, oc / "memory" / "main.sqlite", "memory/main.sqlite")
+
+        # cron/jobs.json
+        src = source / "cron" / "jobs.json"
+        if src.exists():
+            plan_file(src, oc / "cron" / "jobs.json", "cron/jobs.json")
+
+        # extensions/
+        ext_src = source / "extensions"
+        if ext_src.exists():
+            plan_dir(ext_src, oc / "extensions", "extensions")
+
+        # devices/
+        dev_src = source / "devices"
+        if dev_src.exists():
+            plan_dir(dev_src, oc / "devices", "devices")
+
+    def status(self, agent_dir):
+        # type: (Path) -> dict
+        info = {"name": self.display_name, "installed": self.discover()}
+        if agent_dir.exists():
+            info["backed_up"] = True
+            file_count = sum(1 for _ in agent_dir.rglob("*") if _.is_file())
+            info["file_count"] = file_count
+        else:
+            info["backed_up"] = False
+        return info
+
+
+class HermesPlugin(AgentPlugin):
+    """Hermes 备份插件"""
+    name = "hermes"
+    display_name = "Hermes"
+    config_dir = HERMES_HOME
+
+    def backup(self, staging, tier):
+        # type: (Path, str) -> Tuple[List[str], List[dict]]
+        hm = HERMES_HOME
+
+        # config.yaml
+        copy_file_if_exists(hm / "config.yaml", staging / "config.yaml", "config.yaml")
+
+        # SOUL.md
+        copy_file_if_exists(hm / "SOUL.md", staging / "SOUL.md", "SOUL.md")
+
+        # memories/
+        copy_dir_if_exists(hm / "memories", staging / "memories", "memories/")
+
+        # skills/
+        copy_dir_if_exists(hm / "skills", staging / "skills", "skills/")
+
+        # cron/
+        copy_dir_if_exists(hm / "cron", staging / "cron", "cron/")
+
+        return [], []
+
+    def restore(self, source, dry_run, conflict, only_modules, actions_list):
+        # type: (Path, bool, str, Optional[Set[str]], List) -> None
+
+        def plan_file(src, dst, desc):
+            if dst.exists():
+                if conflict == "skip":
+                    actions_list.append(("skip", src, dst, "[跳过] {}（已存在）".format(desc)))
+                elif conflict == "overwrite":
+                    actions_list.append(("overwrite", src, dst, "[覆盖] {}".format(desc)))
+                elif conflict == "backup-existing":
+                    actions_list.append(("backup-overwrite", src, dst, "[备份+覆盖] {}".format(desc)))
+            else:
+                actions_list.append(("create", src, dst, "[新建] {}".format(desc)))
+
+        def plan_dir(src, dst, desc):
+            if not src.exists():
+                return
+            for item in src.rglob("*"):
+                if item.is_file():
+                    rel = item.relative_to(src)
+                    plan_file(item, dst / rel, "{}/{}".format(desc, rel))
+
+        hm = HERMES_HOME
+
+        # config.yaml
+        src = source / "config.yaml"
+        if src.exists():
+            plan_file(src, hm / "config.yaml", "config.yaml")
+
+        # SOUL.md
+        src = source / "SOUL.md"
+        if src.exists():
+            plan_file(src, hm / "SOUL.md", "SOUL.md")
+
+        # memories/
+        mem_src = source / "memories"
+        if mem_src.exists():
+            plan_dir(mem_src, hm / "memories", "memories")
+
+        # skills/
+        skills_src = source / "skills"
+        if skills_src.exists():
+            plan_dir(skills_src, hm / "skills", "skills")
+
+        # cron/
+        cron_src = source / "cron"
+        if cron_src.exists():
+            plan_dir(cron_src, hm / "cron", "cron")
+
+    def status(self, agent_dir):
+        # type: (Path) -> dict
+        info = {"name": self.display_name, "installed": self.discover()}
+        if agent_dir.exists():
+            info["backed_up"] = True
+            file_count = sum(1 for _ in agent_dir.rglob("*") if _.is_file())
+            info["file_count"] = file_count
+        else:
+            info["backed_up"] = False
+        return info
+
+
+# ── Plugin 注册 ──
+
+ALL_PLUGINS = [ClaudeCodePlugin(), OpenClawPlugin(), HermesPlugin()]
+
+
+def discover_agents(agent_filter=None):
+    # type: (Optional[str]) -> List[AgentPlugin]
+    """返回已安装的 Agent 插件列表"""
+    plugins = ALL_PLUGINS
+    if agent_filter:
+        names = {n.strip() for n in agent_filter.split(",")}
+        plugins = [p for p in plugins if p.name in names]
+    return [p for p in plugins if p.discover()]
 
 
 # ── init 命令 ──
@@ -691,18 +1372,25 @@ def cmd_backup(args):
     tier = args.tier
     message = args.message
     push = args.push
+    agent_filter = getattr(args, "agents", None)
 
     # 获取文件锁
     lock_fd = acquire_lock()
     try:
-        _do_backup(repo, tier, message, push)
+        _do_backup(repo, tier, message, push, agent_filter)
     finally:
         release_lock(lock_fd)
 
 
-def _do_backup(repo, tier, message, push):
-    # type: (Path, str, Optional[str], bool) -> None
-    print_header("Claude Code 备份 (v{})".format(SCRIPT_VERSION))
+def _do_backup(repo, tier, message, push, agent_filter=None):
+    # type: (Path, str, Optional[str], bool, Optional[str]) -> None
+    print_header("Agent Migrate 备份 (v{})".format(SCRIPT_VERSION))
+
+    plugins = discover_agents(agent_filter)
+    if not plugins:
+        print_fail("未检测到任何已安装的 Agent")
+        sys.exit(1)
+    print_info("检测到 {} 个 Agent: {}".format(len(plugins), ", ".join(p.display_name for p in plugins)))
     print_info("备份层级: {}".format(tier))
     print_info("备份目标: {}".format(repo))
 
@@ -722,203 +1410,24 @@ def _do_backup(repo, tier, message, push):
     staging_dir.mkdir(parents=True)
 
     all_sanitized_fields = []  # type: List[str]
+    all_skills_manifest = []  # type: List[dict]
+    agent_names = []  # type: List[str]
 
-    # ─── 3. ~/.claude.json（主配置文件）───
-    if CLAUDE_JSON.exists():
-        claude_json_data = read_json_safe(CLAUDE_JSON, ".claude.json")
-        if claude_json_data is not None:
-            sanitized_data, fields = sanitize_claude_json(claude_json_data)
-            all_sanitized_fields.extend(fields)
-            if write_json_safe(staging_dir / "claude.json", sanitized_data, ".claude.json"):
-                projects = sanitized_data.get("projects", {})
-                skill_usage = sanitized_data.get("skillUsage", {})
-                print_ok(".claude.json 已备份（{} 个项目配置, {} 条 skill 使用记录）".format(
-                    len(projects), len(skill_usage)
-                ))
-                if fields:
-                    print_info("  脱敏: {}".format(", ".join(fields)))
-    else:
-        print_info("无 ~/.claude.json，跳过")
+    for plugin in plugins:
+        print_header("备份 {}".format(plugin.display_name))
+        agent_staging = staging_dir / plugin.name
+        agent_staging.mkdir(parents=True, exist_ok=True)
+        sanitized, skills = plugin.backup(agent_staging, tier)
+        all_sanitized_fields.extend(sanitized)
+        all_skills_manifest.extend(skills)
+        agent_names.append(plugin.name)
 
-    # ─── 4. settings.json（脱敏）───
-    settings_src = CLAUDE_HOME / "settings.json"
-    if settings_src.exists():
-        settings_data = read_json_safe(settings_src, "settings.json")
-        if settings_data is not None:
-            sanitized_data, fields = sanitize_settings(settings_data)
-            all_sanitized_fields.extend(fields)
-            if write_json_safe(staging_dir / "settings.json", sanitized_data, "settings.json"):
-                msg = "settings.json 已备份"
-                if fields:
-                    msg += "（脱敏: {}）".format(", ".join(fields))
-                print_ok(msg)
-    else:
-        print_warn("settings.json 不存在，跳过")
-
-    # ─── 5. 全局 CLAUDE.md ───
-    global_memory = CLAUDE_HOME / "CLAUDE.md"
-    if global_memory.exists() and not global_memory.is_symlink():
-        shutil.copy2(str(global_memory), str(staging_dir / "CLAUDE.md"))
-        print_ok("CLAUDE.md（全局 memory）已备份")
-    elif global_memory.is_symlink():
-        print_warn("全局 CLAUDE.md 是符号链接，跳过")
-    else:
-        print_info("无全局 CLAUDE.md，跳过")
-
-    # ─── 6. rules/ ───
-    rules_src = CLAUDE_HOME / "rules"
-    copy_dir_if_exists(rules_src, staging_dir / "rules", "rules/（用户规则）")
-
-    # ─── 7. agents/ ───
-    agents_src = CLAUDE_HOME / "agents"
-    copy_dir_if_exists(agents_src, staging_dir / "agents", "agents/（自定义 agents）")
-
-    # ─── 8. commands/ ───
-    commands_src = CLAUDE_HOME / "commands"
-    copy_dir_if_exists(commands_src, staging_dir / "commands", "commands/（自定义命令）")
-
-    # ─── 9. scheduled_tasks.json ───
-    scheduled_src = CLAUDE_HOME / "scheduled_tasks.json"
-    copy_file_if_exists(
-        scheduled_src, staging_dir / "scheduled_tasks.json",
-        "scheduled_tasks.json（定时任务）"
-    )
-
-    # ─── 9b. stats-cache.json（使用统计）───
-    stats_src = CLAUDE_HOME / "stats-cache.json"
-    copy_file_if_exists(
-        stats_src, staging_dir / "stats-cache.json",
-        "stats-cache.json（使用统计）"
-    )
-
-    # ─── 10. Skills ───
-    skills_src = CLAUDE_HOME / "skills"
-    skills_dst = staging_dir / "skills"
-    skills_dst.mkdir(parents=True, exist_ok=True)
-    skills_manifest = []  # type: List[dict]
-
-    if skills_src.exists():
-        for skill_dir in sorted(skills_src.iterdir()):
-            if not skill_dir.is_dir():
-                continue
-
-            # 跳过非 skill 目录：必须含 SKILL.md 才是合法 skill
-            has_skill_md = (skill_dir / "SKILL.md").exists()
-            if not has_skill_md and skill_dir.name not in SKILL_EXCLUDE_TOPLEVEL:
-                # 递归搜索一层（某些 skill 可能有嵌套 SKILL.md）
-                found = list(skill_dir.rglob("SKILL.md"))
-                if not found:
-                    print_info("跳过非 skill 目录: {}".format(skill_dir.name))
-                    continue
-
-            info = get_skill_info(skill_dir)
-            skills_manifest.append(info)
-
-            if info["type"] == "git":
-                write_gitremote(info, skills_dst)
-                print_ok("skill [{}] -> .gitremote（{}）".format(
-                    info["name"], info["remote"]
-                ))
-            else:
-                copy_skill_local(skill_dir, skills_dst / info["name"])
-                print_ok("skill [{}] -> 完整拷贝".format(info["name"]))
-    else:
-        print_warn("skills/ 目录不存在")
-
-    # ─── 11. 项目级 CLAUDE.md（~/.claude/projects/ 内）───
-    projects_src = CLAUDE_HOME / "projects"
-    projects_dst = staging_dir / "projects"
-    project_memories_count = 0
-
-    if projects_src.exists():
-        for project_dir in projects_src.iterdir():
-            if not project_dir.is_dir():
-                continue
-            for memory_file in [
-                project_dir / "CLAUDE.md",
-                project_dir / "memory" / "CLAUDE.md",
-            ]:
-                if memory_file.exists() and not memory_file.is_symlink():
-                    dst_dir = projects_dst / project_dir.name
-                    dst_dir.mkdir(parents=True, exist_ok=True)
-                    rel = memory_file.relative_to(project_dir)
-                    dst_file = dst_dir / rel
-                    dst_file.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(str(memory_file), str(dst_file))
-                    project_memories_count += 1
-
-    # ─── 12. 项目根目录的 CLAUDE.md ───
-    project_root_mds = find_project_claude_mds()
-    for claude_md_path, project_id in project_root_mds:
-        # 安全检查
-        if not safe_path(claude_md_path, Path.home()):
-            print_warn("跳过不安全路径: {}".format(claude_md_path))
-            continue
-
-        safe_id = project_id.replace("/", "-").replace("\\", "-").strip("-")
-        dst_dir = staging_dir / "project-root-memories" / safe_id
-        dst_dir.mkdir(parents=True, exist_ok=True)
-
-        shutil.copy2(str(claude_md_path), str(dst_dir / "CLAUDE.md"))
-        with open(str(dst_dir / ".source_path"), "w", encoding="utf-8") as f:
-            f.write(str(claude_md_path) + "\n")
-        project_memories_count += 1
-
-    if project_memories_count > 0:
-        print_ok("项目级 memory: {} 个已备份".format(project_memories_count))
-    else:
-        print_info("无项目级 CLAUDE.md")
-
-    # ─── 13. full tier 额外内容 ───
-    if tier == "full":
-        # history.jsonl
-        copy_file_if_exists(
-            CLAUDE_HOME / "history.jsonl",
-            staging_dir / "history.jsonl",
-            "history.jsonl（命令历史）",
-        )
-
-        # plans/（Agent 规划方案文档）
-        plans_src = CLAUDE_HOME / "plans"
-        if plans_src.exists() and any(plans_src.iterdir()):
-            plans_dst = staging_dir / "plans"
-            if plans_dst.exists():
-                shutil.rmtree(str(plans_dst))
-            # 只拷贝 .md 文件，跳过可能的临时文件
-            plans_dst.mkdir(parents=True, exist_ok=True)
-            plans_count = 0
-            for item in plans_src.iterdir():
-                if item.is_file() and item.suffix == ".md":
-                    shutil.copy2(str(item), str(plans_dst / item.name))
-                    plans_count += 1
-            if plans_count > 0:
-                print_ok("plans/ 已备份（{} 个规划文档）".format(plans_count))
-
-        # plugins（排除 .git/node_modules）
-        plugins_src = CLAUDE_HOME / "plugins"
-        if plugins_src.exists():
-            plugins_dst = staging_dir / "plugins"
-            if plugins_dst.exists():
-                shutil.rmtree(str(plugins_dst))
-
-            def plugins_ignore(directory, contents):
-                return {
-                    item for item in contents
-                    if item in {".git", "node_modules", "__pycache__"}
-                }
-
-            _copytree_safe(
-                str(plugins_src), str(plugins_dst),
-                ignore=plugins_ignore
-            )
-            print_ok("plugins/ 已备份")
-
-    # ─── 14. 计算文件哈希 ───
+    # 3. 计算文件哈希
     print_info("正在计算文件完整性哈希...")
     file_hashes = compute_file_hashes(staging_dir)
     file_permissions = record_permissions(staging_dir)
 
-    # ─── 15. 生成 manifest.json ───
+    # 4. 生成 manifest.json
     file_count = len(file_hashes)
 
     manifest = {
@@ -931,24 +1440,8 @@ def _do_backup(repo, tier, message, push):
             "home": str(Path.home()),
         },
         "tier": tier,
-        "contents": {
-            # 检测 staging 目录中实际存在的文件（而非源端）
-            "claude_json": (staging_dir / "claude.json").exists(),
-            "settings_json": (staging_dir / "settings.json").exists(),
-            "global_memory": (staging_dir / "CLAUDE.md").exists(),
-            "rules": (staging_dir / "rules").exists(),
-            "agents": (staging_dir / "agents").exists(),
-            "commands": (staging_dir / "commands").exists(),
-            "scheduled_tasks": (staging_dir / "scheduled_tasks.json").exists(),
-            "stats_cache": (staging_dir / "stats-cache.json").exists(),
-            "skills": len(skills_manifest),
-            "project_memories": project_memories_count,
-            "project_root_memories": len(project_root_mds),
-            "history": (staging_dir / "history.jsonl").exists(),
-            "plugins": (staging_dir / "plugins").exists(),
-            "plans": (staging_dir / "plans").exists(),
-        },
-        "skills": skills_manifest,
+        "agents": agent_names,
+        "skills": all_skills_manifest,
         "sanitized_fields": all_sanitized_fields,
         "file_count": file_count + 1,  # +1 for manifest itself
         "file_hashes": file_hashes,
@@ -959,22 +1452,16 @@ def _do_backup(repo, tier, message, push):
     write_json_safe(manifest_path, manifest, "manifest.json")
     print_ok("manifest.json 已生成（含 {} 个文件哈希）".format(file_count))
 
-    # ─── 16. 原子交换：staging → repo（三步 rename 策略）───
+    # 5. 原子交换：staging → repo（三步 rename 策略）
     print_info("正在执行原子交换...")
 
-    # 确保 .gitignore 包含 staging 目录（防止崩溃后被 git add）
     _ensure_gitignore_entries(repo)
 
-    # 三步原子交换：
-    #   1) rename repo 中的旧内容到 .backup-old（保留 .git/.gitignore/README.md）
-    #   2) move staging 中的新文件到 repo
-    #   3) 成功后删除 .backup-old；失败则回滚
     old_dir = repo / ".backup-old"
     if old_dir.exists():
         shutil.rmtree(str(old_dir))
     old_dir.mkdir()
 
-    # Step 1: 把旧内容移到 .backup-old
     moved_items = []
     moved_from_staging = []
     try:
@@ -985,14 +1472,12 @@ def _do_backup(repo, tier, message, push):
             shutil.move(str(item), str(dst_old))
             moved_items.append((dst_old, repo / item.name))
 
-        # Step 2: 把 staging 中的内容移入 repo
         for item in list(staging_dir.iterdir()):
             dest = repo / item.name
             shutil.move(str(item), str(dest))
             moved_from_staging.append(dest)
 
     except (IOError, OSError, shutil.Error) as e:
-        # 回滚：先清理已从 staging 移入 repo 的文件
         print_fail("原子交换失败: {}，正在回滚...".format(e))
         for staged_item in moved_from_staging:
             if staged_item.exists():
@@ -1003,21 +1488,18 @@ def _do_backup(repo, tier, message, push):
                         staged_item.unlink()
                 except (IOError, OSError):
                     pass
-        # 再把 .backup-old 中的内容移回 repo
         for old_item, original_pos in moved_items:
             if old_item.exists() and not original_pos.exists():
                 try:
                     shutil.move(str(old_item), str(original_pos))
                 except (IOError, OSError):
                     pass
-        # 清理
         if old_dir.exists():
             shutil.rmtree(str(old_dir), ignore_errors=True)
         if staging_dir.exists():
             shutil.rmtree(str(staging_dir), ignore_errors=True)
         raise
 
-    # Step 3: 成功，清理临时目录
     if old_dir.exists():
         shutil.rmtree(str(old_dir), ignore_errors=True)
     if staging_dir.exists():
@@ -1025,7 +1507,7 @@ def _do_backup(repo, tier, message, push):
 
     print_ok("原子交换完成")
 
-    # ─── 17. Git commit（容错：commit 失败不影响已交换的文件）───
+    # 6. Git commit
     run_git(["add", "-A"], cwd=repo)
 
     status_result = run_git(["status", "--porcelain"], cwd=repo)
@@ -1033,7 +1515,9 @@ def _do_backup(repo, tier, message, push):
         print_info("无变更，跳过 commit")
     else:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        commit_msg = message or "Claude Code 备份 ({}) - {}".format(tier, timestamp)
+        commit_msg = message or "Agent Migrate 备份 ({}) - {} - {}".format(
+            tier, ", ".join(agent_names), timestamp
+        )
         commit_result = run_git(["commit", "-m", commit_msg], cwd=repo, check=False)
         if commit_result.returncode == 0:
             print_ok("已提交: {}".format(commit_msg))
@@ -1041,7 +1525,7 @@ def _do_backup(repo, tier, message, push):
             stderr = commit_result.stderr.strip() if commit_result.stderr else "(未知)"
             print_warn("git commit 失败（备份文件已就位，可手动提交）: {}".format(stderr))
 
-    # ─── 18. 可选推送 ───
+    # 7. 可选推送
     if push:
         remote_check = run_git(
             ["remote", "get-url", "origin"], cwd=repo, check=False
@@ -1068,15 +1552,17 @@ def _do_backup(repo, tier, message, push):
                 stderr = result.stderr.strip() if result.stderr else "(未知错误)"
                 print_warn("推送失败: {}".format(stderr))
 
-    # ─── 19. 汇总 ───
+    # 8. 汇总
     print_header("备份完成")
     print_info("备份位置: {}".format(repo))
+    print_info("Agent: {}".format(", ".join(agent_names)))
     print_info("文件总数: {}".format(manifest["file_count"]))
-    print_info("Skills: {} 个（git: {}, 本地: {}）".format(
-        len(skills_manifest),
-        sum(1 for s in skills_manifest if s["type"] == "git"),
-        sum(1 for s in skills_manifest if s["type"] == "local"),
-    ))
+    if all_skills_manifest:
+        print_info("Skills: {} 个（git: {}, 本地: {}）".format(
+            len(all_skills_manifest),
+            sum(1 for s in all_skills_manifest if s["type"] == "git"),
+            sum(1 for s in all_skills_manifest if s["type"] == "local"),
+        ))
     if all_sanitized_fields:
         print_info("脱敏字段: {}".format(", ".join(all_sanitized_fields)))
 
@@ -1099,6 +1585,7 @@ def cmd_restore(args):
     conflict = args.conflict
     only_modules = set(args.only) if args.only else None
     force = args.force
+    agent_filter = getattr(args, "agents", None)
 
     # 获取文件锁
     lock_fd = None
@@ -1106,15 +1593,15 @@ def cmd_restore(args):
         lock_fd = acquire_lock()
 
     try:
-        _do_restore(repo, dry_run, conflict, only_modules, force)
+        _do_restore(repo, dry_run, conflict, only_modules, force, agent_filter)
     finally:
         if lock_fd:
             release_lock(lock_fd)
 
 
-def _do_restore(repo, dry_run, conflict, only_modules, force=False):
-    # type: (Path, bool, str, Optional[Set[str]], bool) -> None
-    print_header("Claude Code 还原" + ("（DRY RUN）" if dry_run else ""))
+def _do_restore(repo, dry_run, conflict, only_modules, force=False, agent_filter=None):
+    # type: (Path, bool, str, Optional[Set[str]], bool, Optional[str]) -> None
+    print_header("Agent Migrate 还原" + ("（DRY RUN）" if dry_run else ""))
 
     if not repo.exists():
         print_fail("备份仓库不存在: {}".format(repo))
@@ -1148,7 +1635,7 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
         print_info("选择性还原: {}".format(", ".join(sorted(only_modules))))
     print()
 
-    # 完整性校验（如果 manifest 中有哈希）
+    # 完整性校验
     file_hashes = manifest.get("file_hashes", {})
     if file_hashes:
         print_info("正在校验备份文件完整性...")
@@ -1178,215 +1665,23 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
 
     actions = []  # type: List[Tuple[str, Path, Path, str]]
 
-    def should_restore(module_name):
-        # type: (str) -> bool
-        """检查是否应该还原此模块"""
-        if only_modules is None:
-            return True
-        return module_name in only_modules
+    # 检测备份格式
+    backup_agents = manifest.get("agents")
 
-    def plan_file(src, dst, desc):
-        # type: (Path, Path, str) -> None
-        if dst.exists():
-            if conflict == "skip":
-                actions.append(("skip", src, dst, "[跳过] {}（已存在）".format(desc)))
-            elif conflict == "overwrite":
-                actions.append(("overwrite", src, dst, "[覆盖] {}".format(desc)))
-            elif conflict == "backup-existing":
-                actions.append(("backup-overwrite", src, dst, "[备份+覆盖] {}".format(desc)))
-        else:
-            actions.append(("create", src, dst, "[新建] {}".format(desc)))
-
-    def plan_dir(src, dst, desc):
-        # type: (Path, Path, str) -> None
-        """规划整个目录的拷贝"""
-        if not src.exists():
-            return
-        for item in src.rglob("*"):
-            if item.is_file():
-                rel = item.relative_to(src)
-                plan_file(item, dst / rel, "{}/{}".format(desc, rel))
-
-    # 1. claude.json -> ~/.claude.json
-    if should_restore("config"):
-        claude_json_src = repo / "claude.json"
-        if claude_json_src.exists():
-            if CLAUDE_JSON.exists() and conflict == "skip":
-                actions.append(("skip", claude_json_src, CLAUDE_JSON,
-                                "[跳过] .claude.json（已存在）"))
-            else:
-                # 智能合并：保留本机敏感值
-                actions.append(("smart-merge-claude-json", claude_json_src, CLAUDE_JSON,
-                                "[智能合并] .claude.json（保留本机敏感值）"))
-
-    # 2. settings.json
-    if should_restore("config"):
-        settings_src = repo / "settings.json"
-        if settings_src.exists():
-            dst = CLAUDE_HOME / "settings.json"
-            if dst.exists() and conflict == "skip":
-                actions.append(("skip", settings_src, dst,
-                                "[跳过] settings.json（已存在）"))
-            else:
-                # 智能合并：保留本机敏感值
-                actions.append(("smart-merge-settings", settings_src, dst,
-                                "[智能合并] settings.json（保留本机敏感值）"))
-
-    # 3. 全局 CLAUDE.md
-    if should_restore("memory"):
-        memory_src = repo / "CLAUDE.md"
-        if memory_src.exists():
-            plan_file(memory_src, CLAUDE_HOME / "CLAUDE.md", "CLAUDE.md（全局 memory）")
-
-    # 4. rules/
-    if should_restore("rules"):
-        rules_src = repo / "rules"
-        if rules_src.exists():
-            plan_dir(rules_src, CLAUDE_HOME / "rules", "rules")
-
-    # 5. agents/
-    if should_restore("agents"):
-        agents_src = repo / "agents"
-        if agents_src.exists():
-            plan_dir(agents_src, CLAUDE_HOME / "agents", "agents")
-
-    # 6. commands/
-    if should_restore("commands"):
-        commands_src = repo / "commands"
-        if commands_src.exists():
-            plan_dir(commands_src, CLAUDE_HOME / "commands", "commands")
-
-    # 7. scheduled_tasks.json
-    if should_restore("scheduled_tasks"):
-        sched_src = repo / "scheduled_tasks.json"
-        if sched_src.exists():
-            plan_file(
-                sched_src, CLAUDE_HOME / "scheduled_tasks.json",
-                "scheduled_tasks.json（定时任务）"
-            )
-
-    # 7b. stats-cache.json（独立 stats 模块）
-    if should_restore("stats"):
-        stats_src = repo / "stats-cache.json"
-        if stats_src.exists():
-            plan_file(
-                stats_src, CLAUDE_HOME / "stats-cache.json",
-                "stats-cache.json（使用统计）"
-            )
-
-    # 8. Skills
-    if should_restore("skills"):
-        skills_src = repo / "skills"
-        if skills_src.exists():
-            for item in sorted(skills_src.iterdir()):
-                if item.is_dir():
-                    plan_dir(
-                        item, CLAUDE_HOME / "skills" / item.name,
-                        "skill/{}".format(item.name)
-                    )
-                elif item.suffix == ".gitremote":
-                    gitinfo = read_json_safe(item, item.name)
-                    if gitinfo is None:
-                        continue
-                    skill_name = gitinfo.get("name", item.stem)
-                    dst = CLAUDE_HOME / "skills" / skill_name
-                    if dst.exists():
-                        if conflict == "skip":
-                            actions.append((
-                                "skip", item, dst,
-                                "[跳过] skill/{}（git, 已存在）".format(skill_name)
-                            ))
-                        elif conflict == "overwrite":
-                            actions.append((
-                                "git-clone", item, dst,
-                                "[重新 clone] skill/{} <- {}".format(
-                                    skill_name, gitinfo.get("remote", "?")
-                                )
-                            ))
-                        elif conflict == "backup-existing":
-                            actions.append((
-                                "git-clone-backup", item, dst,
-                                "[备份+clone] skill/{} <- {}".format(
-                                    skill_name, gitinfo.get("remote", "?")
-                                )
-                            ))
-                    else:
-                        actions.append((
-                            "git-clone", item, dst,
-                            "[clone] skill/{} <- {}".format(
-                                skill_name, gitinfo.get("remote", "?")
-                            )
-                        ))
-
-    # 9. 项目级 memory（~/.claude/projects/）
-    if should_restore("project_memories"):
-        projects_src = repo / "projects"
-        if projects_src.exists():
-            for project_dir in projects_src.iterdir():
-                if project_dir.is_dir():
-                    plan_dir(
-                        project_dir,
-                        CLAUDE_HOME / "projects" / project_dir.name,
-                        "project-memory/{}".format(project_dir.name),
-                    )
-
-    # 10. 项目根目录 CLAUDE.md（路径穿越防护）
-    if should_restore("project_memories"):
-        project_root_src = repo / "project-root-memories"
-        if project_root_src.exists():
-            for project_dir in project_root_src.iterdir():
-                if not project_dir.is_dir():
-                    continue
-                source_path_file = project_dir / ".source_path"
-                if source_path_file.exists():
-                    try:
-                        with open(str(source_path_file), "r", encoding="utf-8") as f:
-                            original_path_str = f.read().strip()
-                    except (IOError, OSError):
-                        continue
-                    original_path = Path(original_path_str)
-
-                    # HOME 路径转换：备份来自不同用户/平台时，替换 HOME 前缀
-                    backup_home = manifest.get("machine", {}).get("home", "")
-                    current_home = str(Path.home())
-                    if backup_home and backup_home != current_home and original_path_str.startswith(backup_home):
-                        # 取出相对于 backup HOME 的部分，用当前 HOME 拼接（处理跨平台路径分隔符）
-                        relative_part = original_path_str[len(backup_home):].lstrip("/").lstrip("\\")
-                        original_path = Path.home() / Path(relative_part.replace("\\", "/"))
-
-                    # 路径穿越防护：必须在 HOME 下
-                    if not safe_path(original_path, Path.home()):
-                        print_warn(
-                            "跳过不安全的还原路径: {} (不在 HOME 目录下)".format(
-                                original_path
-                            )
-                        )
-                        continue
-
-                    claude_md = project_dir / "CLAUDE.md"
-                    if claude_md.exists():
-                        plan_file(
-                            claude_md, original_path,
-                            "项目 CLAUDE.md -> {}".format(original_path)
-                        )
-
-    # 11. history.jsonl
-    if should_restore("history"):
-        history_src = repo / "history.jsonl"
-        if history_src.exists():
-            plan_file(history_src, CLAUDE_HOME / "history.jsonl", "history.jsonl")
-
-    # 12. plugins
-    if should_restore("plugins"):
-        plugins_src = repo / "plugins"
-        if plugins_src.exists():
-            plan_dir(plugins_src, CLAUDE_HOME / "plugins", "plugins")
-
-    # 13. plans/（Agent 规划方案文档）
-    if should_restore("plans"):
-        plans_src = repo / "plans"
-        if plans_src.exists():
-            plan_dir(plans_src, CLAUDE_HOME / "plans", "plans")
+    if backup_agents is None:
+        # v3.x 旧格式：所有内容都是 Claude Code
+        print_info("检测到 v3.x 格式备份，按 Claude Code 处理")
+        plugin = ClaudeCodePlugin()
+        plugin.restore(repo, dry_run, conflict, only_modules, actions)
+    else:
+        # v4.0+ 格式：按 Agent 子目录
+        plugins_to_restore = discover_agents(agent_filter) if agent_filter else ALL_PLUGINS
+        for plugin in plugins_to_restore:
+            if plugin.name in backup_agents:
+                agent_dir = repo / plugin.name
+                if agent_dir.exists():
+                    print_header("还原 {}".format(plugin.display_name))
+                    plugin.restore(agent_dir, dry_run, conflict, only_modules, actions)
 
     # 显示计划
     print_header("还原计划")
@@ -1400,7 +1695,8 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
     create_count = sum(1 for a in actions if a[0] == "create")
     overwrite_count = sum(
         1 for a in actions
-        if a[0] in ("overwrite", "backup-overwrite", "smart-merge-claude-json", "smart-merge-settings")
+        if a[0] in ("overwrite", "backup-overwrite", "smart-merge-claude-json",
+                     "smart-merge-settings", "smart-merge-openclaw-json")
     )
     skip_count = sum(1 for a in actions if a[0] == "skip")
     clone_count = sum(1 for a in actions if a[0] in ("git-clone", "git-clone-backup"))
@@ -1427,7 +1723,6 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
             continue
 
         elif action_type == "smart-merge-claude-json":
-            # 智能合并 .claude.json：不覆盖本机敏感值
             backup_data = read_json_safe(src, ".claude.json backup")
             if backup_data is None:
                 continue
@@ -1436,7 +1731,6 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
                 if live_data is None:
                     live_data = {}
                 merged = smart_merge_config(backup_data, live_data, sanitized_fields)
-                # 备份旧文件
                 if conflict == "backup-existing":
                     backup_path = dst.with_suffix(dst.suffix + ".pre-restore")
                     shutil.copy2(str(dst), str(backup_path))
@@ -1446,7 +1740,6 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
                 write_json_safe(dst, backup_data, ".claude.json")
 
         elif action_type == "smart-merge-settings":
-            # 智能合并 settings.json：不覆盖本机敏感值
             backup_data = read_json_safe(src, "settings.json backup")
             if backup_data is None:
                 continue
@@ -1462,6 +1755,27 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
             else:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 write_json_safe(dst, backup_data, "settings.json")
+
+        elif action_type == "smart-merge-openclaw-json":
+            # OpenClaw: 保留本机 auth，合并其余
+            backup_data = read_json_safe(src, "openclaw.json backup")
+            if backup_data is None:
+                continue
+            if dst.exists():
+                live_data = read_json_safe(dst, "openclaw.json live")
+                if live_data is None:
+                    live_data = {}
+                merged = copy.deepcopy(backup_data)
+                # 保留本机的 auth
+                if "auth" in live_data:
+                    merged["auth"] = live_data["auth"]
+                if conflict == "backup-existing":
+                    backup_path = dst.with_suffix(dst.suffix + ".pre-restore")
+                    shutil.copy2(str(dst), str(backup_path))
+                write_json_safe(dst, merged, "openclaw.json merged")
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                write_json_safe(dst, backup_data, "openclaw.json")
 
         elif action_type == "create":
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1493,7 +1807,6 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
                     gitinfo.get("name", "?"), stderr
                 ))
                 continue
-            # 锁定到备份时的 commit（如果有记录）
             commit_sha = gitinfo.get("commit", "")
             if commit_sha:
                 checkout_result = run_git(
@@ -1524,7 +1837,6 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
                     gitinfo.get("name", "?"), stderr
                 ))
                 continue
-            # 锁定到备份时的 commit
             commit_sha = gitinfo.get("commit", "")
             if commit_sha:
                 checkout_result = run_git(
@@ -1535,21 +1847,17 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
                         commit_sha[:8], branch
                     ))
 
-        # 还原文件权限（如果 manifest 中有记录）
+        # 还原文件权限
         if action_type in (
             "create", "overwrite", "backup-overwrite",
             "smart-merge-claude-json", "smart-merge-settings",
+            "smart-merge-openclaw-json",
         ) and file_permissions_map:
             try:
                 if sys.platform != "win32":
-                    if action_type in ("smart-merge-claude-json", "smart-merge-settings"):
-                        # smart-merge 的 src 是备份仓库中的文件，用其相对路径查权限
-                        rel_path = str(src.relative_to(repo))
-                    else:
-                        rel_path = str(src.relative_to(repo))
+                    rel_path = str(src.relative_to(repo))
                     if rel_path in file_permissions_map:
                         os.chmod(str(dst), file_permissions_map[rel_path])
-                    os.chmod(str(dst), file_permissions_map[rel_path])
             except (ValueError, OSError):
                 pass
 
@@ -1557,7 +1865,6 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
         print_ok(action_label)
 
     # 提醒脱敏字段
-    # 检查还原后是否仍有 REDACTED 值
     settings_live = CLAUDE_HOME / "settings.json"
     if settings_live.exists():
         live_data = read_json_safe(settings_live, "settings.json")
@@ -1582,7 +1889,7 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False):
 def cmd_status(args):
     repo = Path(args.repo).expanduser()
 
-    print_header("Claude Code 备份状态")
+    print_header("Agent Migrate 备份状态")
 
     if not repo.exists() or not (repo / ".git").exists():
         print_warn("备份仓库不存在或不是 git 仓库: {}".format(repo))
@@ -1603,43 +1910,33 @@ def cmd_status(args):
             ))
             print_info("文件总数: {}".format(manifest.get("file_count", "未知")))
 
-            # 内容清单
-            contents = manifest.get("contents", {})
-            if contents:
-                items = []
-                if contents.get("claude_json"):
-                    items.append(".claude.json")
-                if contents.get("settings_json"):
-                    items.append("settings.json")
-                if contents.get("global_memory"):
-                    items.append("CLAUDE.md")
-                if contents.get("rules"):
-                    items.append("rules/")
-                if contents.get("agents"):
-                    items.append("agents/")
-                if contents.get("commands"):
-                    items.append("commands/")
-                if contents.get("scheduled_tasks"):
-                    items.append("scheduled_tasks.json")
-                if contents.get("history"):
-                    items.append("history.jsonl")
-                if contents.get("plugins"):
-                    items.append("plugins/")
-                if contents.get("plans"):
-                    items.append("plans/")
-                print_info("包含: {}".format(", ".join(items)))
+            # Agent 列表
+            backup_agents = manifest.get("agents")
+            if backup_agents:
+                print_info("备份包含 Agent: {}".format(", ".join(backup_agents)))
+
+                # 每个 Agent 的状态
+                for plugin in ALL_PLUGINS:
+                    agent_dir = repo / plugin.name
+                    if plugin.name in backup_agents and agent_dir.exists():
+                        status_info = plugin.status(agent_dir)
+                        installed_str = "已安装" if status_info.get("installed") else "未安装"
+                        print_info("  {} — {} 个文件, 本机{}".format(
+                            plugin.display_name,
+                            status_info.get("file_count", 0),
+                            installed_str,
+                        ))
+            else:
+                # v3.x 格式
+                print_info("备份格式: v3.x（仅 Claude Code）")
 
             skills = manifest.get("skills", [])
-            git_skills = [s for s in skills if s.get("type") == "git"]
-            local_skills = [s for s in skills if s.get("type") == "local"]
-            print_info("Skills: {} 个（git: {}, 本地: {}）".format(
-                len(skills), len(git_skills), len(local_skills)
-            ))
-
-            pm = contents.get("project_memories", 0)
-            prm = contents.get("project_root_memories", 0)
-            if pm or prm:
-                print_info("项目 memory: {} 个（projects/）+ {} 个（项目根目录）".format(pm, prm))
+            if skills:
+                git_skills = [s for s in skills if s.get("type") == "git"]
+                local_skills = [s for s in skills if s.get("type") == "local"]
+                print_info("Skills: {} 个（git: {}, 本地: {}）".format(
+                    len(skills), len(git_skills), len(local_skills)
+                ))
 
             if manifest.get("sanitized_fields"):
                 print_info("脱敏字段: {}".format(
@@ -1686,90 +1983,13 @@ def cmd_status(args):
     else:
         print_info("暂无备份记录")
 
-    # 差异检测
-    print_header("当前配置 vs 最近备份")
-
-    # Skills 差异
-    live_skills = set()  # type: Set[str]
-    skills_dir = CLAUDE_HOME / "skills"
-    if skills_dir.exists():
-        for d in skills_dir.iterdir():
-            if d.is_dir():
-                live_skills.add(d.name)
-
-    backed_skills = set()  # type: Set[str]
-    backup_skills_dir = repo / "skills"
-    if backup_skills_dir.exists():
-        for item in backup_skills_dir.iterdir():
-            if item.is_dir():
-                backed_skills.add(item.name)
-            elif item.suffix == ".gitremote":
-                backed_skills.add(item.stem)
-
-    new_skills = live_skills - backed_skills
-    removed_skills = backed_skills - live_skills
-
-    if new_skills:
-        print_warn("新增未备份的 skills: {}".format(", ".join(sorted(new_skills))))
-    if removed_skills:
-        print_warn("已备份但本地已删除: {}".format(", ".join(sorted(removed_skills))))
-    if not new_skills and not removed_skills:
-        print_ok("Skills 列表与备份一致")
-
-    # settings.json 差异
-    settings_live = CLAUDE_HOME / "settings.json"
-    settings_backup = repo / "settings.json"
-    if settings_live.exists() and settings_backup.exists():
-        live_data = read_json_safe(settings_live, "settings.json live")
-        backup_data = read_json_safe(settings_backup, "settings.json backup")
-
-        if live_data and backup_data:
-            live_compare = copy.deepcopy(live_data)
-            for field in manifest.get("sanitized_fields", []):
-                if "settings.json" not in field:
-                    continue
-                # 解析 "settings.json -> env.KEY" 格式
-                if "->" in field:
-                    key_part = field.split("->")[-1].strip()
-                elif "\u2192" in field:
-                    key_part = field.split("\u2192")[-1].strip()
-                else:
-                    key_part = field
-                parts = key_part.split(".")
-                obj = live_compare
-                for part in parts[:-1]:
-                    if isinstance(obj, dict):
-                        obj = obj.get(part, {})
-                if isinstance(obj, dict) and parts[-1] in obj:
-                    obj[parts[-1]] = REDACTED
-
-            if live_compare == backup_data:
-                print_ok("settings.json 与备份一致（忽略脱敏字段）")
-            else:
-                print_warn("settings.json 已有变更（建议重新备份）")
-
-    # 全局 CLAUDE.md
-    global_memory = CLAUDE_HOME / "CLAUDE.md"
-    backup_memory = repo / "CLAUDE.md"
-    if global_memory.exists() and not backup_memory.exists():
-        print_warn("全局 CLAUDE.md 存在但未备份")
-    elif not global_memory.exists() and backup_memory.exists():
-        print_info("备份中有全局 CLAUDE.md，但本地已删除")
-    elif global_memory.exists() and backup_memory.exists():
-        with open(str(global_memory), "r", encoding="utf-8") as f:
-            live_text = f.read()
-        with open(str(backup_memory), "r", encoding="utf-8") as f:
-            backup_text = f.read()
-        if live_text == backup_text:
-            print_ok("全局 CLAUDE.md 与备份一致")
+    # 已安装 Agent 概览
+    print_header("本机已安装 Agent")
+    for plugin in ALL_PLUGINS:
+        if plugin.discover():
+            print_ok("{} ({})".format(plugin.display_name, plugin.config_dir))
         else:
-            print_warn("全局 CLAUDE.md 已有变更（建议重新备份）")
-
-    # .claude.json 差异
-    if CLAUDE_JSON.exists() and (repo / "claude.json").exists():
-        print_ok(".claude.json 已备份")
-    elif CLAUDE_JSON.exists():
-        print_warn(".claude.json 存在但未备份（可能是旧版备份）")
+            print_info("{} 未安装".format(plugin.display_name))
 
     print()
 
@@ -1777,115 +1997,137 @@ def cmd_status(args):
 # ── validate 命令 ──
 
 def cmd_validate(args):
-    print_header("Claude Code 安装验证")
+    print_header("Agent Migrate 安装验证")
 
     issues = 0
 
-    # 1. ~/.claude.json
-    if CLAUDE_JSON.exists():
-        data = read_json_safe(CLAUDE_JSON, ".claude.json")
-        if data is not None:
-            print_ok(".claude.json 有效（{} 个顶层键）".format(len(data)))
+    # 逐 Agent 验证
+    for plugin in ALL_PLUGINS:
+        if not plugin.discover():
+            continue
 
-            # 检查脱敏占位符
-            if data.get("userID") == REDACTED:
-                print_warn(
-                    ".claude.json 中 userID 为占位符（正常，会自动重新生成）"
-                )
-        else:
-            print_fail(".claude.json 解析失败")
-            issues += 1
-    else:
-        print_info("无 ~/.claude.json（首次启动时会自动创建）")
+        print_header("{} 验证".format(plugin.display_name))
 
-    # 2. settings.json
-    settings_path = CLAUDE_HOME / "settings.json"
-    if settings_path.exists():
-        data = read_json_safe(settings_path, "settings.json")
-        if data is not None:
-            print_ok("settings.json 是有效 JSON")
-
-            env = data.get("env", {})
-            redacted = [k for k, v in env.items() if v == REDACTED]
-            if redacted:
-                print_fail("settings.json 中残留 {} 占位符: {}".format(
-                    REDACTED, ", ".join(redacted)
-                ))
-                issues += 1
-            else:
-                print_ok("settings.json 无残留占位符")
-        else:
-            print_fail("settings.json 解析失败")
-            issues += 1
-    else:
-        print_warn("settings.json 不存在")
-        issues += 1
-
-    # 3. Skills 完整性
-    skills_dir = CLAUDE_HOME / "skills"
-    if skills_dir.exists():
-        for skill_dir in sorted(skills_dir.iterdir()):
-            if not skill_dir.is_dir():
-                continue
-            skill_md = skill_dir / "SKILL.md"
-            if skill_md.exists():
-                print_ok("skill [{}] SKILL.md OK".format(skill_dir.name))
-            else:
-                found = list(skill_dir.rglob("SKILL.md"))
-                if found:
-                    print_ok("skill [{}] SKILL.md OK（{}）".format(
-                        skill_dir.name, found[0].relative_to(skill_dir)
-                    ))
+        if isinstance(plugin, ClaudeCodePlugin):
+            # 1. ~/.claude.json
+            if CLAUDE_JSON.exists():
+                data = read_json_safe(CLAUDE_JSON, ".claude.json")
+                if data is not None:
+                    print_ok(".claude.json 有效（{} 个顶层键）".format(len(data)))
+                    if data.get("userID") == REDACTED:
+                        print_warn(".claude.json 中 userID 为占位符（正常，会自动重新生成）")
                 else:
-                    print_warn("skill [{}] 缺少 SKILL.md".format(skill_dir.name))
+                    print_fail(".claude.json 解析失败")
+                    issues += 1
+            else:
+                print_info("无 ~/.claude.json（首次启动时会自动创建）")
+
+            # 2. settings.json
+            settings_path = CLAUDE_HOME / "settings.json"
+            if settings_path.exists():
+                data = read_json_safe(settings_path, "settings.json")
+                if data is not None:
+                    print_ok("settings.json 是有效 JSON")
+                    env = data.get("env", {})
+                    redacted = [k for k, v in env.items() if v == REDACTED]
+                    if redacted:
+                        print_fail("settings.json 中残留 {} 占位符: {}".format(
+                            REDACTED, ", ".join(redacted)
+                        ))
+                        issues += 1
+                    else:
+                        print_ok("settings.json 无残留占位符")
+                else:
+                    print_fail("settings.json 解析失败")
+                    issues += 1
+            else:
+                print_warn("settings.json 不存在")
+                issues += 1
+
+            # 3. Skills 完整性
+            skills_dir = CLAUDE_HOME / "skills"
+            if skills_dir.exists():
+                for skill_dir in sorted(skills_dir.iterdir()):
+                    if not skill_dir.is_dir():
+                        continue
+                    skill_md = skill_dir / "SKILL.md"
+                    if skill_md.exists():
+                        print_ok("skill [{}] SKILL.md OK".format(skill_dir.name))
+                    else:
+                        found = list(skill_dir.rglob("SKILL.md"))
+                        if found:
+                            print_ok("skill [{}] SKILL.md OK（{}）".format(
+                                skill_dir.name, found[0].relative_to(skill_dir)
+                            ))
+                        else:
+                            print_warn("skill [{}] 缺少 SKILL.md".format(skill_dir.name))
+                            issues += 1
+
+                    git_dir = skill_dir / ".git"
+                    if git_dir.exists():
+                        result = run_git(
+                            ["remote", "get-url", "origin"],
+                            cwd=skill_dir, check=False,
+                        )
+                        if result.returncode == 0:
+                            remote = result.stdout.strip()
+                            if remote.startswith("http") or remote.startswith("git@"):
+                                print_ok("  - git remote: {}".format(remote))
+                            else:
+                                print_warn("  - git remote 格式异常: {}".format(remote))
+                                issues += 1
+            else:
+                print_warn("skills/ 目录不存在")
+
+            # 4. 其他配置目录
+            for name, label in [
+                ("rules", "用户规则"),
+                ("agents", "自定义 agents"),
+                ("commands", "自定义命令"),
+            ]:
+                path = CLAUDE_HOME / name
+                if path.exists():
+                    count = sum(1 for f in path.rglob("*.md"))
+                    print_ok("{} / 存在（{} 个 .md 文件）".format(name, count))
+
+            # 5. 全局 CLAUDE.md
+            global_memory = CLAUDE_HOME / "CLAUDE.md"
+            if global_memory.exists():
+                print_ok("全局 CLAUDE.md 存在")
+            else:
+                print_info("无全局 CLAUDE.md（可通过 /memory 创建）")
+
+            # 6. scheduled_tasks.json
+            sched = CLAUDE_HOME / "scheduled_tasks.json"
+            if sched.exists():
+                data = read_json_safe(sched, "scheduled_tasks.json")
+                if data is not None:
+                    print_ok("scheduled_tasks.json 有效")
+                else:
+                    print_fail("scheduled_tasks.json 无效")
                     issues += 1
 
-            # Git-based skills
-            git_dir = skill_dir / ".git"
-            if git_dir.exists():
-                result = run_git(
-                    ["remote", "get-url", "origin"],
-                    cwd=skill_dir, check=False,
-                )
-                if result.returncode == 0:
-                    remote = result.stdout.strip()
-                    if remote.startswith("http") or remote.startswith("git@"):
-                        print_ok("  - git remote: {}".format(remote))
-                    else:
-                        print_warn("  - git remote 格式异常: {}".format(remote))
-                        issues += 1
-    else:
-        print_warn("skills/ 目录不存在")
+        elif isinstance(plugin, OpenClawPlugin):
+            oc = OPENCLAW_HOME
+            oc_json = oc / "openclaw.json"
+            if oc_json.exists():
+                data = read_json_safe(oc_json, "openclaw.json")
+                if data is not None:
+                    print_ok("openclaw.json 有效")
+                else:
+                    print_fail("openclaw.json 解析失败")
+                    issues += 1
 
-    # 4. 其他配置目录
-    for name, label in [
-        ("rules", "用户规则"),
-        ("agents", "自定义 agents"),
-        ("commands", "自定义命令"),
-    ]:
-        path = CLAUDE_HOME / name
-        if path.exists():
-            count = sum(1 for f in path.rglob("*.md"))
-            print_ok("{} / 存在（{} 个 .md 文件）".format(name, count))
+        elif isinstance(plugin, HermesPlugin):
+            hm = HERMES_HOME
+            cfg = hm / "config.yaml"
+            if cfg.exists():
+                print_ok("config.yaml 存在")
+            else:
+                print_warn("config.yaml 不存在")
+                issues += 1
 
-    # 5. 全局 CLAUDE.md
-    global_memory = CLAUDE_HOME / "CLAUDE.md"
-    if global_memory.exists():
-        print_ok("全局 CLAUDE.md 存在")
-    else:
-        print_info("无全局 CLAUDE.md（可通过 /memory 创建）")
-
-    # 6. scheduled_tasks.json
-    sched = CLAUDE_HOME / "scheduled_tasks.json"
-    if sched.exists():
-        data = read_json_safe(sched, "scheduled_tasks.json")
-        if data is not None:
-            print_ok("scheduled_tasks.json 有效")
-        else:
-            print_fail("scheduled_tasks.json 无效")
-            issues += 1
-
-    # 7. 备份仓库完整性
+    # 备份仓库完整性
     repo = Path(args.repo).expanduser() if hasattr(args, "repo") else DEFAULT_REPO
     manifest_path = repo / "manifest.json"
     if manifest_path.exists():
@@ -1925,7 +2167,7 @@ def cmd_validate(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Claude Code 一键迁移工具 v{}".format(SCRIPT_VERSION),
+        description="Agent Migrate — 多 Agent 统一备份/迁移工具 v{}".format(SCRIPT_VERSION),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -1933,9 +2175,11 @@ def main():
   %(prog)s backup                                          # 备份到 ~/.claude-backup
   %(prog)s backup --push                                   # 备份并推送到远程
   %(prog)s backup --tier full --push -m "完整备份"          # 完整备份并推送
+  %(prog)s backup --agents claude-code                     # 只备份 Claude Code
   %(prog)s restore --dry-run                               # 预览还原
   %(prog)s restore --conflict backup-existing              # 实际还原
   %(prog)s restore --only skills memory                    # 只还原 skills 和 memory
+  %(prog)s restore --agents openclaw                       # 只还原 OpenClaw
   %(prog)s status                                          # 查看备份状态
   %(prog)s validate                                        # 健康检查
         """,
@@ -1943,7 +2187,7 @@ def main():
 
     parser.add_argument(
         "--version", action="version",
-        version="claude-migrate v{}".format(SCRIPT_VERSION),
+        version="agent-migrate v{}".format(SCRIPT_VERSION),
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1959,7 +2203,7 @@ def main():
     p_init.add_argument("--git-email", help="Git 邮箱")
 
     # backup
-    p_backup = subparsers.add_parser("backup", help="备份当前 Claude Code 配置")
+    p_backup = subparsers.add_parser("backup", help="备份已安装的 Agent 配置")
     p_backup.add_argument(
         "--repo", default=str(DEFAULT_REPO),
         help="备份仓库路径（默认: ~/.claude-backup）",
@@ -1972,9 +2216,12 @@ def main():
     p_backup.add_argument(
         "--push", action="store_true", help="备份后推送到 remote"
     )
+    p_backup.add_argument(
+        "--agents", help="只操作指定 Agent（逗号分隔，如 claude-code,openclaw）"
+    )
 
     # restore
-    p_restore = subparsers.add_parser("restore", help="从备份还原 Claude Code 配置")
+    p_restore = subparsers.add_parser("restore", help="从备份还原 Agent 配置")
     p_restore.add_argument(
         "--repo", default=str(DEFAULT_REPO),
         help="备份仓库路径（默认: ~/.claude-backup）",
@@ -1994,6 +2241,9 @@ def main():
     p_restore.add_argument(
         "--force", action="store_true", default=False,
         help="完整性校验失败时强制继续还原",
+    )
+    p_restore.add_argument(
+        "--agents", help="只还原指定 Agent（逗号分隔）"
     )
 
     # status

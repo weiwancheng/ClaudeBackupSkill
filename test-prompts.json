@@ -1,0 +1,5 @@
+[
+  {"id": 1, "prompt": "备份一下", "expected": "触发 agent-migrate，执行 backup --push，告知检测到哪些 Agent，push 前确认"},
+  {"id": 2, "prompt": "我要换机器了，帮我把所有东西迁移过去", "expected": "给出完整 4 步换机流程：backup --tier full --push → git clone → restore → validate，涵盖所有 Agent"},
+  {"id": 3, "prompt": "只还原 OpenClaw 的配置到新机器", "expected": "使用 --agents openclaw 参数还原，不影响 Claude Code 和 Hermes"}
+]

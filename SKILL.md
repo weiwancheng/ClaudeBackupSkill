@@ -1,170 +1,255 @@
 ---
-name: claude-migrate
+name: agent-mind-migrate
 description: |
-  Claude Code 一键备份/迁移 Skill。将所有积累（skills、memory、settings、.claude.json、rules、agents、commands、定时任务、使用统计、规划方案）备份到 Git 仓库，支持跨机器一键还原和远程推送。
-  当用户想要备份、迁移、导出 Claude Code 配置和积累时使用。触发词包括但不限于：备份、迁移、backup、restore、migrate、搬家、换机器、一键迁移、导出配置、导入配置、备份我的配置、帮我打包、迁移到新机器、备份你的记忆技能、保存你的记忆、备份记忆。
-  即使用户只是说"我要换机器了"或"帮我把这些东西保存下来"或"备份一下你的记忆和技能"，只要上下文暗示需要保存/迁移 Claude Code 的状态，都应该触发。
-  不要用于普通的文件备份（用户只是想备份某个项目文件）、不要用于 git 操作（用户只是想 commit/push 代码）。
+  多 Agent 统一备份/迁移工具。一键备份 Claude Code、OpenClaw、Hermes 等 AI Agent 的全部配置和积累到 Git 仓库，支持跨机器一键还原。自动发现已安装的 Agent，按 Agent 独立存储。
+  触发词：备份、迁移、backup、restore、migrate、搬家、换机器、一键迁移、导出配置、导入配置、备份我的配置、帮我打包、迁移到新机器、备份你的记忆技能、保存你的记忆、备份记忆、agent备份、多agent迁移。
+  即使用户只是说"我要换机器了"或"帮我把这些东西保存下来"或"备份一下"，只要上下文暗示需要保存/迁移 AI Agent 的状态，都应该触发。
+  不要用于普通的文件备份或 git 操作。
 metadata:
   category: custom
   author: weiwancheng
+  version: "4.0"
 ---
 
-# Claude Code 一键迁移 v3.4
+# Agent Mind Migrate v4.0 — 多 Agent 统一迁移
 
-本 Skill 将 Claude Code 的**全部积累**备份到一个 Git 仓库中，支持跨机器一键还原和定期远程推送。跨平台支持 Windows / macOS / Linux。
+一条命令备份你所有 AI Agent 的积累，一条命令还原到新机器。
 
-## 备份覆盖范围
+**脚本路径**：`~/.claude/skills/agent-mind-migrate/scripts/migrate.py`（下文简写为 `migrate.py`）
+
+---
+
+## 命令速查
+
+| 命令 | 用途 | 示例 |
+|------|------|------|
+| `backup` | 备份所有已安装 Agent | `migrate.py backup --push` |
+| `restore` | 从备份还原 | `migrate.py restore --dry-run` |
+| `init` | 初始化远程仓库 | `migrate.py init --remote <url>` |
+| `status` | 查看备份状态 | `migrate.py status` |
+| `validate` | 健康检查 | `migrate.py validate` |
+
+---
+
+## backup — 备份
+
+```bash
+python migrate.py backup [--tier essential|full] [--agents claude-code,openclaw,hermes] [--push]
+```
+
+- 自动发现本机已安装的 Agent，全部备份到 `~/.claude-backup/`
+- **执行前先 `status` 展示检测到的 Agent 列表和上次备份时间，用户确认后再执行**
+- `--tier essential`（默认）：核心配置。`--tier full`：含历史和插件（**换机器推荐**）
+- `--agents`：只备份指定 Agent。不传则自动发现并备份所有
+- `--push`：推送到远程仓库（**网络外发操作，执行前告知用户**）
+- 自动脱敏 token/密码 → `__REDACTED__`
+- 原子写入 + SHA-256 完整性校验
+
+## restore — 还原
+
+> **⚠️ 还原前必须先 dry-run 预览。** 跳过 dry-run 直接执行会提示警告。
+
+```bash
+# 第一步：预览将要还原的内容
+python migrate.py restore --dry-run
+# 第二步：确认无误后执行（用户确认后再运行）
+python migrate.py restore --conflict <overwrite|skip|backup-existing> \
+  [--agents claude-code,openclaw] [--only skills memory config]
+```
+
+- `--conflict` 策略：`overwrite` 覆盖 / `skip` 跳过已有 / `backup-existing` 备份旧文件后覆盖（**推荐**）
+- `--agents`：只还原指定 Agent
+- `--only`：按模块粒度选择，可选模块：`config` `memory` `skills` `rules` `agents` `commands` `scheduled_tasks` `stats` `plans` `history` `plugins` `project_memories`
+- 智能合并：`__REDACTED__` 占位符保留本机已有敏感值
+- `--force`：完整性校验失败时强制继续（谨慎使用）
+- **还原完成后自动执行 `validate`，展示结果并提醒用户检查 `__REDACTED__` 字段**
+
+## init — 初始化远程仓库
+
+```bash
+python migrate.py init --remote <git-url> [--git-user "名字"] [--git-email "邮箱"]
+```
+
+首次使用时运行。之后 `backup --push` 即可直接推送。
+
+## status / validate
+
+```bash
+python migrate.py status     # 每个 Agent 的备份时间、文件数、完整性
+python migrate.py validate   # 本机环境健康检查
+```
+
+`status` 输出示例：
+```
+Claude Code  ✅ 上次备份: 2026-04-16 19:10  文件: 42  完整性: OK
+OpenClaw     ✅ 上次备份: 2026-04-16 19:10  文件: 8   完整性: OK
+Hermes       ⚠️ 未检测到（~/.hermes/ 不存在）
+```
+
+---
+
+## 支持的 Agent
+
+| Agent | 配置目录 | 备份内容 | 脱敏 |
+|-------|---------|---------|------|
+| **Claude Code** | `~/.claude/` | 主配置、settings、memory、skills、rules、agents、commands、定时任务、统计、项目记忆 | token/密码 → `__REDACTED__` |
+| **OpenClaw** | `~/.openclaw/` | 主配置、bot配置、记忆(sqlite)、定时任务、插件、设备 | auth 字段 → `__REDACTED__` |
+| **Hermes** | `~/.hermes/` | 配置、身份(SOUL.md)、记忆、技能、定时任务 | 敏感文件直接排除 |
+
+<details>
+<summary>各 Agent 备份详情（点击展开）</summary>
+
+### Claude Code
 
 | 内容 | 文件/路径 | essential | full |
 |------|-----------|:---------:|:----:|
-| 主配置 | `~/.claude.json`（项目授权、MCP服务器、使用偏好） | Y | Y |
-| Settings | `~/.claude/settings.json`（环境变量、权限、hooks） | Y | Y |
+| 主配置 | `~/.claude.json` | Y | Y |
+| Settings | `~/.claude/settings.json` | Y | Y |
 | 全局 Memory | `~/.claude/CLAUDE.md` | Y | Y |
-| Skills | `~/.claude/skills/`（所有已安装的 skill） | Y | Y |
-| Rules | `~/.claude/rules/`（用户自定义规则） | Y | Y |
-| Agents | `~/.claude/agents/`（自定义 agents） | Y | Y |
-| Commands | `~/.claude/commands/`（自定义命令） | Y | Y |
+| Skills | `~/.claude/skills/` | Y | Y |
+| Rules | `~/.claude/rules/` | Y | Y |
+| Agents | `~/.claude/agents/` | Y | Y |
+| Commands | `~/.claude/commands/` | Y | Y |
 | 定时任务 | `~/.claude/scheduled_tasks.json` | Y | Y |
 | 使用统计 | `~/.claude/stats-cache.json` | Y | Y |
-| 项目级 Memory | `~/.claude/projects/*/CLAUDE.md` + 项目根目录的 CLAUDE.md | Y | Y |
+| 项目级 Memory | `~/.claude/projects/*/CLAUDE.md` | Y | Y |
 | 命令历史 | `~/.claude/history.jsonl` | - | Y |
-| 规划方案 | `~/.claude/plans/*.md`（Agent 规划文档） | - | Y |
+| 规划方案 | `~/.claude/plans/*.md` | - | Y |
 | Plugins | `~/.claude/plugins/` | - | Y |
 
-## 核心脚本
+### OpenClaw
 
-```
-python ~/.claude/skills/claude-migrate/scripts/migrate.py <command> [options]
-```
+| 内容 | 文件/路径 | 排除 |
+|------|-----------|------|
+| 主配置 | `openclaw.json`（auth 脱敏） | `credentials/` |
+| Bot 配置 | `clawdbot.json` | `*.bak*` |
+| 记忆 | `memory/main.sqlite` | `logs/` |
+| 定时任务 | `cron/jobs.json` | `tasks/` |
+| 插件 | `extensions/`（跳过 node_modules） | |
+| 设备 | `devices/` | |
 
-## 五个命令
+### Hermes
 
-### 1. init — 初始化并配置远程仓库
+| 内容 | 文件/路径 | 排除 |
+|------|-----------|------|
+| 配置 | `config.yaml` | `.env` |
+| 身份 | `SOUL.md` | `auth.json` |
+| 记忆 | `memories/`（MEMORY.md, USER.md） | `logs/` |
+| 技能 | `skills/` | `sessions/` |
+| 定时任务 | `cron/` | `browser_recordings/` |
 
-```bash
-python ~/.claude/skills/claude-migrate/scripts/migrate.py init --remote <git-url> [--git-user "名字"] [--git-email "邮箱"]
-```
-
-首次使用时运行。会创建 `~/.claude-backup/` git 仓库并配置 remote。之后 `backup --push` 就能直接推送。
-
-### 2. backup — 备份当前配置
-
-```bash
-python ~/.claude/skills/claude-migrate/scripts/migrate.py backup [--tier essential|full] [--message "说明"] [--push]
-```
-
-- `--tier essential`（默认）：核心配置 + skills + memory + rules + agents + commands + 定时任务 + 统计
-- `--tier full`：上述 + 命令历史 + plugins + 规划方案（换机器时推荐）
-- `--push`：备份后推送到远程仓库（**网络外发操作，执行前告知用户**）
-- 自动脱敏：token/密码/代理地址替换为 `__REDACTED__`
-- Git-based skills 只存 remote URL（`.gitremote`），不拷贝 node_modules
-- 原子写入：通过 staging 目录保证备份完整性
-- SHA-256 哈希：每个文件的哈希值记录在 manifest.json 中
-
-### 3. restore — 还原配置
-
-```bash
-# 必须先 dry-run
-python ~/.claude/skills/claude-migrate/scripts/migrate.py restore --dry-run
-# 确认后实际执行
-python ~/.claude/skills/claude-migrate/scripts/migrate.py restore --conflict <overwrite|skip|backup-existing>
-# 只还原指定模块
-python ~/.claude/skills/claude-migrate/scripts/migrate.py restore --conflict backup-existing --only skills memory config
-```
-
-可选模块名：config, memory, skills, rules, agents, commands, scheduled_tasks, stats, plans, history, plugins, project_memories
-
-**智能合并**：settings.json 和 .claude.json 还原时自动检测 `__REDACTED__` 占位符，保留本机已有的敏感值，不会覆盖。
-
-### 4. status — 查看备份状态
-
-```bash
-python ~/.claude/skills/claude-migrate/scripts/migrate.py status
-```
-
-包含完整性校验：自动验证备份文件的 SHA-256 哈希。
-
-### 5. validate — 健康检查
-
-```bash
-python ~/.claude/skills/claude-migrate/scripts/migrate.py validate
-```
-
-## 使用场景
-
-**用户说「备份一下你的记忆和技能」或「备份」**：
-```bash
-python ~/.claude/skills/claude-migrate/scripts/migrate.py backup --push
-```
-
-**用户说「我要换机器了」**：
-1. 旧机器: `backup --push`
-2. 新机器: `git clone <repo-url> ~/.claude-backup`
-3. 新机器: `restore --dry-run` → 确认 → `restore --conflict backup-existing`
-4. 新机器: `validate` → 手动填写脱敏字段
-
-**用户首次配置远程仓库**：
-```bash
-python ~/.claude/skills/claude-migrate/scripts/migrate.py init --remote <url>
-python ~/.claude/skills/claude-migrate/scripts/migrate.py backup --push
-```
-
-**只还原 skills 和记忆**：
-```bash
-python ~/.claude/skills/claude-migrate/scripts/migrate.py restore --conflict backup-existing --only skills memory
-```
-
-## 错误处理
-
-| 场景 | 表现 | 处理 |
-|------|------|------|
-| 未 init 就 `--push` | git push 报错 no remote | 先执行 `init --remote <url>`，再重试 backup |
-| 网络断开时 push 失败 | 备份已完成，仅推送失败 | 本地备份不受影响，网络恢复后 `backup --push` 重试 |
-| restore 校验失败 | SHA-256 不匹配 | 默认中止；`--force` 可跳过（谨慎使用） |
-| 新机器不知道 repo URL | 无法 clone | 旧机器执行 `status` 查看 remote 地址 |
-| 还原后脱敏字段为 `__REDACTED__` | 敏感值需手动填写 | 智能合并会保留本机已有值；纯新机器需手动补 token/密码 |
+</details>
 
 ---
 
-## 变更历史
+## 备份目录结构
+
+每个 Agent 独立一个文件夹，互不干扰：
+
+```
+~/.claude-backup/
+├── manifest.json           # agents: ["claude-code", "openclaw", "hermes"]
+├── claude-code/            # Claude Code 的所有备份
+│   ├── claude.json
+│   ├── settings.json
+│   ├── skills/
+│   └── ...
+├── openclaw/               # OpenClaw 的备份
+│   ├── openclaw.json
+│   ├── memory/
+│   └── ...
+└── hermes/                 # Hermes 的备份
+    ├── config.yaml
+    ├── memories/
+    └── ...
+```
+
+向后兼容：检测到 v3.x 旧格式（无 Agent 子目录）时，自动按 Claude Code 处理。
+
+---
+
+## 使用场景
+
+> **快速决策**：用户说「备份」→ `backup --push`。说「换机器」→ 走完整迁移流程。说「只还原XX」→ `restore --agents/--only`。
+
+### 「备份一下」
+
+```bash
+python migrate.py backup --push
+```
+
+### 「我要换机器了」
+
+```
+旧机器：
+  1. backup --tier full --push
+
+新机器：
+  2. git clone <backup-repo-url> ~/.claude-backup
+  3. python ~/.claude-backup/claude-code/skills/agent-mind-migrate/scripts/migrate.py restore --dry-run
+     ↑ 新机器上首次还原，从备份仓库内直接运行脚本
+  4. restore --conflict backup-existing
+  5. validate → 手动填写 __REDACTED__ 脱敏字段
+```
+
+### 「只还原某个 Agent」
+
+```bash
+python migrate.py restore --agents openclaw --conflict backup-existing
+```
+
+### 「只还原 skills 和记忆」
+
+```bash
+python migrate.py restore --conflict backup-existing --only skills memory
+```
+
+---
+
+## 错误处理
+
+| 场景 | 处理 |
+|------|------|
+| Agent 未安装（目录不存在） | 自动跳过，status 中标注「未检测到」 |
+| 未 init 就 `--push` | 提示先执行 `init --remote <url>` |
+| 网络断开时 push 失败 | 本地备份不受影响，网络恢复后重试 |
+| restore 校验失败（SHA-256 不匹配） | 默认中止并提示重新 clone；`--force` 可跳过 |
+| 旧格式备份（v3.x） | 自动识别为 Claude Code，正常还原 |
+| `__REDACTED__` 占位符 | 智能合并保留本机已有值；纯新机器需手动补 |
+| 备份仓库不存在 | 提示先 `git clone` 或 `init` |
+| OpenClaw sqlite 被其他进程锁定 | 等待或提示关闭 OpenClaw 后重试 |
+| 备份仓库磁盘空间不足 | 中止并提示可用空间和预计需要大小 |
+
+---
 
 <details>
-<summary>v3.0 → v3.4 变更记录（点击展开）</summary>
+<summary>变更历史（点击展开）</summary>
+
+### v4.0
+- 多 Agent 支持：Claude Code + OpenClaw + Hermes
+- 备份目录按 Agent 独立存储
+- 新增 `--agents` 参数按 Agent 筛选
+- AgentPlugin 架构，可扩展更多 Agent
+- 向后兼容 v3.x 备份格式
+- 重命名 claude-migrate → agent-mind-migrate
 
 ### v3.4
-- 跨平台兼容：移除 `fcntl` 硬依赖，Windows 用 `msvcrt` 条件导入
-- symlink 安全回退：Windows 无管理员权限时 fallback 为拷贝
-- 权限处理跨平台：Windows 上跳过 Unix 权限记录/还原
-- 用户名检测统一：改用 `getpass.getuser()`
-- 跨平台路径还原：支持 Linux↔Windows 路径分隔符差异
+- 跨平台兼容（Windows / macOS / Linux）
+- symlink 安全回退、权限处理跨平台
 
 ### v3.3
-- skill 备份智能过滤：跳过无 SKILL.md 的非 skill 目录
-- description 精简：变更日志移至 body
+- skill 备份智能过滤、description 精简
 
 ### v3.2
-- .claude.json 白名单过滤：剔除 30+ 个无用运行时字段
-- BASE_URL 不再脱敏
-- 原子交换回滚完整性：中途失败清理已移入文件
-- 跨用户 HOME 路径自动转换
-- git clone 锁定 commit SHA
-- projects 深度合并还原：allowedTools 取并集
+- .claude.json 白名单过滤、原子交换回滚
+- 跨用户 HOME 路径转换、git clone 锁定 SHA
 
 ### v3.1
-- plans/ 备份（full tier）
-- 项目根 CLAUDE.md 发现增强
-- smart-merge 权限还原
-- stats 独立还原模块
-- manifest 精准检测、.gitignore 按行匹配
-- 完整性校验失败退出、--version 参数
+- plans/ 备份、smart-merge 权限还原
+- manifest 精准检测、完整性校验
 
 ### v3.0
-- 原子备份（staging 目录 → 交换）
-- SHA-256 完整性校验
-- 智能合并还原（保留本机敏感值）
-- 隐私深度清理、路径穿越防护
-- 文件权限保留、flock 并发锁
-- 选择性恢复（--only）、敏感键白名单
+- 原子备份、SHA-256 校验、智能合并还原
+- 隐私深度清理、选择性恢复
 
 </details>
