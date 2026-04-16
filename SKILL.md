@@ -14,51 +14,6 @@ metadata:
 
 本 Skill 将 Claude Code 的**全部积累**备份到一个 Git 仓库中，支持跨机器一键还原和定期远程推送。跨平台支持 Windows / macOS / Linux。
 
-## v3.4 改进
-
-- **跨平台兼容**：移除 `fcntl` 硬依赖，Windows 用 `msvcrt`，Unix 用 `fcntl`（条件导入），脚本在 Windows 上不再崩溃
-- **symlink 安全回退**：Windows 无管理员权限时自动 fallback 为跟随 symlink 拷贝
-- **权限处理跨平台**：Windows 上跳过 Unix 权限记录/还原（权限模型不兼容，避免无意义数据）
-- **用户名检测统一**：改用 `getpass.getuser()` 替代环境变量探测，三平台行为一致
-- **跨平台路径还原**：HOME 路径转换支持 Linux↔Windows 的路径分隔符差异
-
-## v3.3 改进
-
-- **skill 备份智能过滤**：备份时跳过无 SKILL.md 的非 skill 目录（eval workspace、临时目录等不再被误备份）
-- **SKILL.md description 精简**：变更日志从触发描述移至 body，减少 metadata 层上下文占用，提升触发精度
-
-## v3.2 关键改进
-
-- **.claude.json 白名单过滤**：顶层字段改为白名单策略，仅保留 projects/skillUsage/githubRepoPaths 等有意义字段，剔除 30+ 个无用运行时字段（numStartups、migration flags、tips 等）
-- **BASE_URL 不再脱敏**：ANTHROPIC_BASE_URL、OPENAI_BASE_URL 等地址类字段不再被替换为 `__REDACTED__`，还原后无需手动填写
-- **原子交换回滚完整性**：Step 2 中途失败时，已从 staging 移入 repo 的文件也会被清理，不再留下新旧混合的脏状态
-- **跨用户 HOME 路径自动转换**：还原 project-root-memories 时自动将备份中的 HOME 前缀替换为当前机器的 HOME，支持 will→alice 等跨用户迁移
-- **git clone 锁定 commit SHA**：还原 git-based skill 时 checkout 到备份时记录的精确 commit，而非分支最新
-- **projects 深度合并还原**：smart_merge 支持 projects 字典深度合并，新机器上已有的项目授权不会被覆盖丢失，allowedTools 取并集
-
-## v3.1 关键改进
-
-- **plans/ 备份**（full tier）：Agent 规划方案文档纳入备份，换机器后可查阅历史规划
-- **项目根 CLAUDE.md 发现增强**：同时扫描 `githubRepoPaths` 和 `projects` 字典键，覆盖非 GitHub 项目
-- **smart-merge 权限还原**：智能合并配置文件后也恢复原始权限
-- **stats 独立还原模块**：`--only stats` 单独还原使用统计，不与 config 混合
-- **manifest 精准检测**：`contents` 字段改为检测实际备份结果（staging 目录），而非检测源端
-- **.gitignore 按行匹配**：避免注释中的子串误匹配
-- **完整性校验失败退出**：restore 时校验失败默认中止，`--force` 可跳过
-- **--version 参数**：`python migrate.py --version` 快速确认版本号
-
-## v3.0 关键改进
-
-- **原子备份**：先写到 `.backup-staging/` 临时目录，全部成功后再交换到仓库，中途失败不会损坏已有备份
-- **SHA-256 完整性校验**：每个文件记录哈希值，restore/status/validate 时自动验证
-- **智能合并还原**：检测到 `__REDACTED__` 时保留本机实际敏感值，不覆盖
-- **隐私深度清理**：.claude.json 中 lastSessionId、lastCost、lastTotalInputTokens 等运行时数据自动剥离
-- **路径穿越防护**：.source_path 还原目标必须在 $HOME 下
-- **文件权限保留**：备份时记录、还原时恢复文件权限
-- **flock 并发锁**：防止多个 backup/restore 实例同时运行
-- **选择性恢复**：`--only skills memory` 只还原指定模块
-- **敏感键白名单**：不再用正则匹配，避免误伤
-
 ## 备份覆盖范围
 
 | 内容 | 文件/路径 | essential | full |
@@ -159,3 +114,47 @@ python ~/.claude/skills/claude-migrate/scripts/migrate.py backup --push
 ```bash
 python ~/.claude/skills/claude-migrate/scripts/migrate.py restore --conflict backup-existing --only skills memory
 ```
+
+---
+
+## 变更历史
+
+<details>
+<summary>v3.0 → v3.4 变更记录（点击展开）</summary>
+
+### v3.4
+- 跨平台兼容：移除 `fcntl` 硬依赖，Windows 用 `msvcrt` 条件导入
+- symlink 安全回退：Windows 无管理员权限时 fallback 为拷贝
+- 权限处理跨平台：Windows 上跳过 Unix 权限记录/还原
+- 用户名检测统一：改用 `getpass.getuser()`
+- 跨平台路径还原：支持 Linux↔Windows 路径分隔符差异
+
+### v3.3
+- skill 备份智能过滤：跳过无 SKILL.md 的非 skill 目录
+- description 精简：变更日志移至 body
+
+### v3.2
+- .claude.json 白名单过滤：剔除 30+ 个无用运行时字段
+- BASE_URL 不再脱敏
+- 原子交换回滚完整性：中途失败清理已移入文件
+- 跨用户 HOME 路径自动转换
+- git clone 锁定 commit SHA
+- projects 深度合并还原：allowedTools 取并集
+
+### v3.1
+- plans/ 备份（full tier）
+- 项目根 CLAUDE.md 发现增强
+- smart-merge 权限还原
+- stats 独立还原模块
+- manifest 精准检测、.gitignore 按行匹配
+- 完整性校验失败退出、--version 参数
+
+### v3.0
+- 原子备份（staging 目录 → 交换）
+- SHA-256 完整性校验
+- 智能合并还原（保留本机敏感值）
+- 隐私深度清理、路径穿越防护
+- 文件权限保留、flock 并发锁
+- 选择性恢复（--only）、敏感键白名单
+
+</details>
