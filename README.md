@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🧠 agent-mind-migrate
+<img src="assets/hero-banner.svg" alt="agent-mind-migrate — Migrate your AI agent's mind" width="100%">
+
+<br>
 
 **Migrate your AI agent's mind to a new machine — skills, memory, config, everything.**
 
@@ -249,17 +251,16 @@ python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py restore --conflic
 
 ---
 
-## Requirements
-
-- Python 3.8+ (standard library only, zero `pip install`)
-- Git CLI
-
----
-
 <div align="center">
+
+<img src="assets/features.svg" alt="Features: Multi-Agent, Auto-Discover, Secret Redaction, Atomic Writes, SHA-256 Verify, Zero Deps" width="100%">
+
+<br><br>
 
 **Your agent's mind deserves a backup plan.**
 
 MIT License · Made by [AlphaWill](https://github.com/AlphaWill0)
 
 </div>
+
+<!-- SEO: claude code backup, claude code migrate, claude code skills backup, AI agent migration tool, claude code config backup restore, claude code new machine setup, claude code dotfiles, claude code settings sync, AI agent backup tool, claude code skill manager, 备份claude code, claude code迁移, AI agent换机器 -->

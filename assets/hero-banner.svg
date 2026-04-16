@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="280" viewBox="0 0 800 280">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f0f23;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1a1a3e;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="glow" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#6366f1;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#a78bfa;stop-opacity:1" />
+    </linearGradient>
+    <filter id="shadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="6" flood-color="#6366f1" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="280" rx="12" fill="url(#bg)"/>
+
+  <!-- Decorative grid dots -->
+  <g fill="#6366f1" opacity="0.08">
+    <circle cx="50" cy="50" r="2"/><circle cx="90" cy="50" r="2"/><circle cx="130" cy="50" r="2"/><circle cx="170" cy="50" r="2"/>
+    <circle cx="50" cy="90" r="2"/><circle cx="90" cy="90" r="2"/><circle cx="130" cy="90" r="2"/><circle cx="170" cy="90" r="2"/>
+    <circle cx="630" cy="190" r="2"/><circle cx="670" cy="190" r="2"/><circle cx="710" cy="190" r="2"/><circle cx="750" cy="190" r="2"/>
+    <circle cx="630" cy="230" r="2"/><circle cx="670" cy="230" r="2"/><circle cx="710" cy="230" r="2"/><circle cx="750" cy="230" r="2"/>
+  </g>
+
+  <!-- Brain icon -->
+  <g transform="translate(400, 75)" filter="url(#shadow)">
+    <text font-size="56" text-anchor="middle" dy="18">🧠</text>
+  </g>
+
+  <!-- Arrow flow: Agent → Git → New Machine -->
+  <g transform="translate(400, 140)">
+    <!-- Left: Agent box -->
+    <rect x="-280" y="-18" width="120" height="36" rx="8" fill="none" stroke="url(#glow)" stroke-width="1.5" opacity="0.7"/>
+    <text x="-220" y="5" font-family="monospace" font-size="13" fill="#a78bfa" text-anchor="middle">Your Agent</text>
+
+    <!-- Arrow 1 -->
+    <line x1="-155" y1="0" x2="-85" y2="0" stroke="#6366f1" stroke-width="1.5" opacity="0.5"/>
+    <polygon points="-88,0 -95,-4 -95,4" fill="#6366f1" opacity="0.5"/>
+    <text x="-120" y="-10" font-family="monospace" font-size="10" fill="#6366f1" text-anchor="middle" opacity="0.7">backup</text>
+
+    <!-- Center: Git repo -->
+    <rect x="-80" y="-18" width="160" height="36" rx="8" fill="#6366f1" fill-opacity="0.15" stroke="url(#glow)" stroke-width="1.5"/>
+    <text x="0" y="5" font-family="monospace" font-size="13" fill="#e0e7ff" text-anchor="middle">Git Backup Repo</text>
+
+    <!-- Arrow 2 -->
+    <line x1="85" y1="0" x2="155" y2="0" stroke="#6366f1" stroke-width="1.5" opacity="0.5"/>
+    <polygon points="152,0 145,-4 145,4" fill="#6366f1" opacity="0.5"/>
+    <text x="120" y="-10" font-family="monospace" font-size="10" fill="#6366f1" text-anchor="middle" opacity="0.7">restore</text>
+
+    <!-- Right: New Machine -->
+    <rect x="160" y="-18" width="130" height="36" rx="8" fill="none" stroke="url(#glow)" stroke-width="1.5" opacity="0.7"/>
+    <text x="225" y="5" font-family="monospace" font-size="13" fill="#a78bfa" text-anchor="middle">New Machine</text>
+  </g>
+
+  <!-- Title -->
+  <text x="400" y="210" font-family="system-ui, -apple-system, sans-serif" font-size="28" font-weight="700" fill="#e0e7ff" text-anchor="middle" letter-spacing="-0.5">agent-mind-migrate</text>
+
+  <!-- Subtitle -->
+  <text x="400" y="240" font-family="system-ui, -apple-system, sans-serif" font-size="14" fill="#94a3b8" text-anchor="middle">Migrate your AI agent's mind — skills, memory, config, everything.</text>
+
+  <!-- Version badge -->
+  <g transform="translate(400, 258)">
+    <rect x="-20" y="-10" width="40" height="18" rx="9" fill="#6366f1" fill-opacity="0.2"/>
+    <text x="0" y="3" font-family="monospace" font-size="10" fill="#a78bfa" text-anchor="middle">v4.0</text>
+  </g>
+</svg>
