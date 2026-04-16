@@ -7,7 +7,7 @@ description: |
   不要用于普通的文件备份或 git 操作。
 metadata:
   category: custom
-  author: weiwancheng
+  author: AlphaWill
   version: "4.0"
 ---
 
@@ -38,7 +38,7 @@ python migrate.py backup [--tier essential|full] [--agents claude-code,openclaw,
 ```
 
 - 自动发现本机已安装的 Agent，全部备份到 `~/.claude-backup/`
-- **执行前先 `status` 展示检测到的 Agent 列表和上次备份时间，用户确认后再执行**
+- **备份前先告知用户检测到哪些 Agent、上次备份时间，确认后再执行**
 - `--tier essential`（默认）：核心配置。`--tier full`：含历史和插件（**换机器推荐**）
 - `--agents`：只备份指定 Agent。不传则自动发现并备份所有
 - `--push`：推送到远程仓库（**网络外发操作，执行前告知用户**）
@@ -62,7 +62,7 @@ python migrate.py restore --conflict <overwrite|skip|backup-existing> \
 - `--only`：按模块粒度选择，可选模块：`config` `memory` `skills` `rules` `agents` `commands` `scheduled_tasks` `stats` `plans` `history` `plugins` `project_memories`
 - 智能合并：`__REDACTED__` 占位符保留本机已有敏感值
 - `--force`：完整性校验失败时强制继续（谨慎使用）
-- **还原完成后自动执行 `validate`，展示结果并提醒用户检查 `__REDACTED__` 字段**
+- **还原完成后建议执行 `validate`，检查结果并提醒用户填写 `__REDACTED__` 字段**
 
 ## init — 初始化远程仓库
 

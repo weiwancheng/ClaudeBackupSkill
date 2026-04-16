@@ -153,9 +153,9 @@ Backward compatible: v3.x backups (flat structure) are auto-detected as Claude C
 
 | Agent | Config Dir | Status |
 |-------|-----------|--------|
-| [Claude Code](https://claude.ai/claude-code) | `~/.claude/` | ✅ Full support |
-| [OpenClaw](https://github.com/openclaw) | `~/.openclaw/` | ✅ Full support |
-| [Hermes](https://github.com/NousResearch/hermes-agent) | `~/.hermes/` | ✅ Full support |
+| Claude Code | `~/.claude/` | ✅ Full support |
+| OpenClaw | `~/.openclaw/` | ✅ Full support |
+| Hermes | `~/.hermes/` | ✅ Full support |
 
 The plugin architecture makes it easy to add more agents. PRs welcome!
 
@@ -194,6 +194,7 @@ python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py backup --push
 # 换机器还原
 git clone <备份仓库URL> ~/.claude-backup
 git clone https://github.com/AlphaWill0/agent-mind-migrate.git ~/.claude/skills/agent-mind-migrate
+python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py restore --dry-run
 python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py restore --conflict backup-existing
 ```
 

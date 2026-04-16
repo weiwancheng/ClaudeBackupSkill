@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Agent Migrate v4.0 — 多 Agent 统一备份/迁移工具
+Agent Mind Migrate v4.0 — 多 Agent 统一备份/迁移工具
 用法: python migrate.py <backup|restore|status|validate|init> [options]
 
 支持 Agent: Claude Code, OpenClaw, Hermes
@@ -134,7 +134,7 @@ RESTORE_MODULES = frozenset({
 # 最小兼容的 manifest 版本
 MIN_COMPATIBLE_VERSION = "2.0"
 
-LOCK_FILE = Path(tempfile.gettempdir()) / "agent-migrate.lock"
+LOCK_FILE = Path(tempfile.gettempdir()) / "agent-mind-migrate.lock"
 
 
 # ── Agent Plugin 架构 ──
@@ -626,12 +626,12 @@ def _ensure_gitignore_entries(repo):
         missing = [e for e in GITIGNORE_REQUIRED_ENTRIES if e not in existing_lines]
         if missing:
             with open(str(gitignore), "a", encoding="utf-8") as f:
-                f.write("\n# auto-added by agent-migrate v4.0\n")
+                f.write("\n# auto-added by agent-mind-migrate v4.0\n")
                 for entry in missing:
                     f.write(entry + "\n")
     else:
         with open(str(gitignore), "w", encoding="utf-8") as f:
-            f.write("# Agent Migrate backup — auto-generated\n")
+            f.write("# Agent Mind Migrate backup — auto-generated\n")
             for entry in GITIGNORE_REQUIRED_ENTRIES:
                 f.write(entry + "\n")
 
@@ -1384,7 +1384,7 @@ def cmd_backup(args):
 
 def _do_backup(repo, tier, message, push, agent_filter=None):
     # type: (Path, str, Optional[str], bool, Optional[str]) -> None
-    print_header("Agent Migrate 备份 (v{})".format(SCRIPT_VERSION))
+    print_header("Agent Mind Migrate 备份 (v{})".format(SCRIPT_VERSION))
 
     plugins = discover_agents(agent_filter)
     if not plugins:
@@ -1515,7 +1515,7 @@ def _do_backup(repo, tier, message, push, agent_filter=None):
         print_info("无变更，跳过 commit")
     else:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        commit_msg = message or "Agent Migrate 备份 ({}) - {} - {}".format(
+        commit_msg = message or "Agent Mind Migrate 备份 ({}) - {} - {}".format(
             tier, ", ".join(agent_names), timestamp
         )
         commit_result = run_git(["commit", "-m", commit_msg], cwd=repo, check=False)
@@ -1601,7 +1601,7 @@ def cmd_restore(args):
 
 def _do_restore(repo, dry_run, conflict, only_modules, force=False, agent_filter=None):
     # type: (Path, bool, str, Optional[Set[str]], bool, Optional[str]) -> None
-    print_header("Agent Migrate 还原" + ("（DRY RUN）" if dry_run else ""))
+    print_header("Agent Mind Migrate 还原" + ("（DRY RUN）" if dry_run else ""))
 
     if not repo.exists():
         print_fail("备份仓库不存在: {}".format(repo))
@@ -1889,7 +1889,7 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False, agent_filter
 def cmd_status(args):
     repo = Path(args.repo).expanduser()
 
-    print_header("Agent Migrate 备份状态")
+    print_header("Agent Mind Migrate 备份状态")
 
     if not repo.exists() or not (repo / ".git").exists():
         print_warn("备份仓库不存在或不是 git 仓库: {}".format(repo))
@@ -1997,7 +1997,7 @@ def cmd_status(args):
 # ── validate 命令 ──
 
 def cmd_validate(args):
-    print_header("Agent Migrate 安装验证")
+    print_header("Agent Mind Migrate 安装验证")
 
     issues = 0
 
@@ -2167,7 +2167,7 @@ def cmd_validate(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Agent Migrate — 多 Agent 统一备份/迁移工具 v{}".format(SCRIPT_VERSION),
+        description="Agent Mind Migrate — 多 Agent 统一备份/迁移工具 v{}".format(SCRIPT_VERSION),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -2187,7 +2187,7 @@ def main():
 
     parser.add_argument(
         "--version", action="version",
-        version="agent-migrate v{}".format(SCRIPT_VERSION),
+        version="agent-mind-migrate v{}".format(SCRIPT_VERSION),
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
