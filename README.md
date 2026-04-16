@@ -72,9 +72,10 @@ python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py backup --push
 ```bash
 # On the new machine:
 git clone <your-backup-repo-url> ~/.claude-backup
-python3 ~/.claude-backup/claude-code/skills/agent-mind-migrate/scripts/migrate.py restore --dry-run
+git clone https://github.com/AlphaWill0/agent-mind-migrate.git ~/.claude/skills/agent-mind-migrate
+python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py restore --dry-run
 # Review the output, then:
-python3 ~/.claude-backup/claude-code/skills/agent-mind-migrate/scripts/migrate.py restore --conflict backup-existing
+python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py restore --conflict backup-existing
 ```
 
 Done. Your agent remembers everything.
@@ -192,7 +193,8 @@ python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py backup --push
 
 # 换机器还原
 git clone <备份仓库URL> ~/.claude-backup
-python3 ~/.claude-backup/claude-code/skills/agent-mind-migrate/scripts/migrate.py restore --conflict backup-existing
+git clone https://github.com/AlphaWill0/agent-mind-migrate.git ~/.claude/skills/agent-mind-migrate
+python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py restore --conflict backup-existing
 ```
 
 ### 特色

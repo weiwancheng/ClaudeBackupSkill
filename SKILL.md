@@ -186,10 +186,10 @@ python migrate.py backup --push
 
 新机器：
   2. git clone <backup-repo-url> ~/.claude-backup
-  3. python ~/.claude-backup/claude-code/skills/agent-mind-migrate/scripts/migrate.py restore --dry-run
-     ↑ 新机器上首次还原，从备份仓库内直接运行脚本
-  4. restore --conflict backup-existing
-  5. validate → 手动填写 __REDACTED__ 脱敏字段
+  3. git clone https://github.com/AlphaWill0/agent-mind-migrate.git ~/.claude/skills/agent-mind-migrate
+  4. python ~/.claude/skills/agent-mind-migrate/scripts/migrate.py restore --dry-run
+  5. restore --conflict backup-existing
+  6. validate → 手动填写 __REDACTED__ 脱敏字段
 ```
 
 ### 「只还原某个 Agent」
