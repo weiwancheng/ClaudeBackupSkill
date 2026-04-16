@@ -232,6 +232,32 @@ Backward compatible: v3.x flat backups are auto-detected as Claude Code.
 
 **Your agent's mind deserves a backup plan.**
 
-[中文说明](https://github.com/AlphaWill0/agent-mind-migrate/wiki/中文说明) · MIT License · Made by [AlphaWill](https://github.com/AlphaWill0)
+[中文说明](#-中文说明) · MIT License · Made by [AlphaWill](https://github.com/AlphaWill0)
 
 </div>
+
+---
+
+## 🇨🇳 中文说明
+
+**agent-mind-migrate** — 多 AI Agent 统一迁移工具。
+
+你花了几周调教 AI Agent——技能、记忆、设置、规则全都配好了。换台电脑，一切归零。这个工具把 Agent 的「心智」全部备份到 Git 仓库，换机器一条命令还原。
+
+**支持的 Agent：** Claude Code · OpenClaw · Hermes
+
+**使用方式：** 对 Claude Code 说「备份一下」即可。或手动运行：
+
+```bash
+# 安装
+git clone https://github.com/AlphaWill0/agent-mind-migrate.git ~/.claude/skills/agent-mind-migrate
+
+# 备份
+python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py backup --push
+
+# 换机器还原
+git clone <备份仓库URL> ~/.claude-backup
+git clone https://github.com/AlphaWill0/agent-mind-migrate.git ~/.claude/skills/agent-mind-migrate
+python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py restore --dry-run
+python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py restore --conflict backup-existing
+```
