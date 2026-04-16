@@ -2,7 +2,9 @@
 
 # 🧠 agent-mind-migrate
 
-**Your AI agent spent weeks learning. Don't lose it to a new machine.**
+**Migrate your AI agent's mind to a new machine — skills, memory, config, everything.**
+
+One command to backup. One command to restore. Zero dependencies.
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -11,48 +13,38 @@
 
 </div>
 
-```
-$ python migrate.py backup --push
-
-  Detecting agents...
-  ✅ Claude Code   ~/.claude/     42 files
-  ✅ OpenClaw      ~/.openclaw/    8 files
-  ⚠️  Hermes       not installed, skipping
-
-  Backing up...
-  ✅ SHA-256 verified  ✅ Secrets redacted  ✅ Pushed to remote
-
-  Done in 3.2s. Your agents' minds are safe.
-```
-
 ---
 
-## The Problem
+## 💡 The Problem
 
-You spent weeks teaching your AI agent — custom skills, tuned settings, accumulated memory, rules, commands, cron jobs. Then you switch machines and **it's all gone**.
+You've spent weeks teaching your AI agent. Custom skills, carefully tuned settings, accumulated memory, rules, commands, cron jobs. Then you switch machines — and it's all gone. Starting from scratch.
 
-`agent-mind-migrate` backs up your agent's entire "mind" into a Git repo. One command to save. One command to restore. **Zero dependencies** (Python 3.8+ stdlib only).
+**agent-mind-migrate** solves this. It backs up your AI agent's entire "mind" — everything that makes it *yours* — into a Git repo. Switch machines, restore in seconds.
 
-## 30-Second Quick Start
+## ⚡ Quick Start
 
-```bash
-# 1. Install (one line)
-git clone https://github.com/AlphaWill0/agent-mind-migrate.git ~/.claude/skills/agent-mind-migrate
+**Just say this to Claude Code:**
 
-# 2. Connect your backup repo
-python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py init --remote <your-repo-url>
-
-# 3. Backup — that's it
-python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py backup --push
+```
+帮我安装 agent-mind-migrate
 ```
 
-Or, if you use Claude Code, just say:
+Claude will clone the repo, set up the skill, and connect your backup repo — all automatically.
+
+Or install manually:
+
+```bash
+git clone https://github.com/AlphaWill0/agent-mind-migrate.git ~/.claude/skills/agent-mind-migrate
+python3 ~/.claude/skills/agent-mind-migrate/scripts/migrate.py init --remote <your-repo-url>
+```
+
+Then back up anytime by saying:
 
 ```
 备份一下
 ```
 
-Claude will detect your agents, show you what it found, and back everything up. **You don't need to remember any commands.**
+Claude detects your agents, shows what it found, and backs everything up. **You don't need to remember any commands.**
 
 ## New Machine? 4 Steps.
 
