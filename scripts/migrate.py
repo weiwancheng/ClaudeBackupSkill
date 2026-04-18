@@ -45,8 +45,8 @@ OPENCLAW_HOME = Path.home() / ".openclaw"
 HERMES_HOME = Path.home() / ".hermes"
 DEFAULT_REPO = Path.home() / ".claude-backup"
 REDACTED = "__REDACTED__"
-SCRIPT_VERSION = "4.0"
-MANIFEST_VERSION = "4.0"
+SCRIPT_VERSION = "4.1"
+MANIFEST_VERSION = "4.1"
 
 # 敏感环境变量键名——白名单精确匹配（不再用正则）
 SENSITIVE_ENV_KEYS = frozenset({
@@ -136,6 +136,28 @@ MIN_COMPATIBLE_VERSION = "2.0"
 
 LOCK_FILE = Path(tempfile.gettempdir()) / "agent-mind-migrate.lock"
 
+# ── i18n ──
+
+def _detect_lang():
+    # type: () -> str
+    """Detect UI language from LANG env var. Returns 'zh' or 'en'."""
+    lang = os.environ.get("LANG", "").lower()
+    if lang.startswith("zh"):
+        return "zh"
+    # Also check LC_ALL and LANGUAGE
+    for var in ("LC_ALL", "LANGUAGE"):
+        val = os.environ.get(var, "").lower()
+        if val.startswith("zh"):
+            return "zh"
+    return "en"
+
+UI_LANG = _detect_lang()
+
+def _t(zh, en):
+    # type: (str, str) -> str
+    """Return localized string based on detected language."""
+    return zh if UI_LANG == "zh" else en
+
 
 # ── Agent Plugin 架构 ──
 
@@ -160,6 +182,29 @@ class AgentPlugin:
     def status(self, agent_dir):
         """返回状态信息 dict"""
         raise NotImplementedError
+
+    @staticmethod
+    def _plan_file(actions_list, conflict, src, dst, desc):
+        """Helper: plan a single file restore action."""
+        if dst.exists():
+            if conflict == "skip":
+                actions_list.append(("skip", src, dst, _t("[跳过] {}（已存在）", "[skip] {} (exists)").format(desc)))
+            elif conflict == "overwrite":
+                actions_list.append(("overwrite", src, dst, _t("[覆盖] {}", "[overwrite] {}").format(desc)))
+            elif conflict == "backup-existing":
+                actions_list.append(("backup-overwrite", src, dst, _t("[备份+覆盖] {}", "[backup+overwrite] {}").format(desc)))
+        else:
+            actions_list.append(("create", src, dst, _t("[新建] {}", "[create] {}").format(desc)))
+
+    @staticmethod
+    def _plan_dir(actions_list, conflict, src, dst, desc):
+        """Helper: plan a directory restore (file by file)."""
+        if not src.exists():
+            return
+        for item in src.rglob("*"):
+            if item.is_file():
+                rel = item.relative_to(src)
+                AgentPlugin._plan_file(actions_list, conflict, item, dst / rel, "{}/{}".format(desc, rel))
 
 
 # ── 工具函数 ──
@@ -326,11 +371,38 @@ def sanitize_settings(data):
     sanitized = copy.deepcopy(data)
     redacted_fields = []
 
+    # Redact top-level env
     env = sanitized.get("env", {})
     for key, value in env.items():
         if is_sensitive_key(key) and value and value != REDACTED:
             env[key] = REDACTED
             redacted_fields.append("settings.json -> env.{}".format(key))
+
+    # Redact mcpServers env and args containing secrets
+    mcp_servers = sanitized.get("mcpServers", {})
+    for server_name, server_conf in mcp_servers.items():
+        if not isinstance(server_conf, dict):
+            continue
+        # Redact env dict within each MCP server
+        server_env = server_conf.get("env", {})
+        if isinstance(server_env, dict):
+            for key, value in server_env.items():
+                if is_sensitive_key(key) and value and value != REDACTED:
+                    server_env[key] = REDACTED
+                    redacted_fields.append("settings.json -> mcpServers.{}.env.{}".format(server_name, key))
+        # Redact args like --token <val>, --key <val>, --secret <val>
+        server_args = server_conf.get("args", [])
+        if isinstance(server_args, list):
+            sensitive_flags = {"--token", "--key", "--secret", "--api-key", "--password", "--auth"}
+            i = 0
+            while i < len(server_args):
+                if isinstance(server_args[i], str) and server_args[i].lower() in sensitive_flags:
+                    if i + 1 < len(server_args) and server_args[i + 1] != REDACTED:
+                        redacted_fields.append("settings.json -> mcpServers.{}.args[{}]".format(server_name, i + 1))
+                        server_args[i + 1] = REDACTED
+                        i += 2
+                        continue
+                i += 1
 
     return sanitized, redacted_fields
 
@@ -412,6 +484,20 @@ def smart_merge_config(backup_data, live_data, sanitized_fields):
 
 # ── Skill 处理 ──
 
+def _strip_url_credentials(url):
+    # type: (str) -> str
+    """Strip user:password@ from a git remote URL to prevent credential leakage."""
+    # Handle https://user:token@github.com/... format
+    if "://" in url and "@" in url:
+        scheme_end = url.index("://") + 3
+        at_pos = url.index("@")
+        # Only strip if @ comes before the first / after scheme
+        slash_pos = url.find("/", scheme_end)
+        if slash_pos == -1 or at_pos < slash_pos:
+            return url[:scheme_end] + url[at_pos + 1:]
+    return url
+
+
 def get_skill_info(skill_dir):
     # type: (Path) -> dict
     """获取 skill 的信息：是否 git repo，remote URL 等"""
@@ -423,7 +509,7 @@ def get_skill_info(skill_dir):
         result = run_git(["remote", "get-url", "origin"], cwd=skill_dir, check=False)
         if result.returncode == 0 and result.stdout.strip():
             info["type"] = "git"
-            info["remote"] = result.stdout.strip()
+            info["remote"] = _strip_url_credentials(result.stdout.strip())
 
             # 获取当前 branch
             result_branch = run_git(
@@ -505,14 +591,14 @@ def copy_dir_if_exists(src, dst, label):
 def copy_file_if_exists(src, dst, label):
     # type: (Path, Path, str) -> bool
     """如果源文件存在则拷贝，返回是否拷贝了"""
-    if src.exists() and not src.is_symlink():
+    if src.is_symlink():
+        print_warn(_t("{} 是符号链接，跳过", "{} is a symlink, skipping").format(label))
+        return False
+    if src.exists():
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(src), str(dst))
-        print_ok("{} 已备份".format(label))
+        print_ok(_t("{} 已备份", "{} backed up").format(label))
         return True
-    elif src.is_symlink():
-        print_warn("{} 是符号链接，跳过".format(label))
-        return False
     return False
 
 
@@ -842,24 +928,8 @@ class ClaudeCodePlugin(AgentPlugin):
                 return True
             return module_name in only_modules
 
-        def plan_file(src, dst, desc):
-            if dst.exists():
-                if conflict == "skip":
-                    actions_list.append(("skip", src, dst, "[跳过] {}（已存在）".format(desc)))
-                elif conflict == "overwrite":
-                    actions_list.append(("overwrite", src, dst, "[覆盖] {}".format(desc)))
-                elif conflict == "backup-existing":
-                    actions_list.append(("backup-overwrite", src, dst, "[备份+覆盖] {}".format(desc)))
-            else:
-                actions_list.append(("create", src, dst, "[新建] {}".format(desc)))
-
-        def plan_dir(src, dst, desc):
-            if not src.exists():
-                return
-            for item in src.rglob("*"):
-                if item.is_file():
-                    rel = item.relative_to(src)
-                    plan_file(item, dst / rel, "{}/{}".format(desc, rel))
+        plan_file = lambda src, dst, desc: AgentPlugin._plan_file(actions_list, conflict, src, dst, desc)
+        plan_dir = lambda src, dst, desc: AgentPlugin._plan_dir(actions_list, conflict, src, dst, desc)
 
         # 1. claude.json -> ~/.claude.json
         if should_restore("config"):
@@ -998,8 +1068,28 @@ class ClaudeCodePlugin(AgentPlugin):
                             continue
                         original_path = Path(original_path_str)
 
+                        # Cross-machine path translation: replace old HOME with current HOME
+                        current_home = Path.home()
+                        try:
+                            # Try to read manifest for backup machine's home path
+                            manifest_file = source.parent / "manifest.json" if source.name != "manifest.json" else source / "manifest.json"
+                            # source is the agent dir (repo/claude-code), manifest is at repo level
+                            repo_root = source.parent
+                            manifest_data = read_json_safe(repo_root / "manifest.json", "manifest")
+                            if manifest_data:
+                                old_home_str = manifest_data.get("machine", {}).get("home", "")
+                                if old_home_str:
+                                    old_home = Path(old_home_str)
+                                    try:
+                                        rel_to_old_home = original_path.relative_to(old_home)
+                                        original_path = current_home / rel_to_old_home
+                                    except ValueError:
+                                        pass  # Path not under old HOME, keep as-is
+                        except Exception:
+                            pass
+
                         # 路径穿越防护
-                        if not safe_path(original_path, Path.home()):
+                        if not safe_path(original_path, current_home):
                             print_warn(
                                 "跳过不安全的还原路径: {} (不在 HOME 目录下)".format(
                                     original_path
@@ -1139,24 +1229,8 @@ class OpenClawPlugin(AgentPlugin):
     def restore(self, source, dry_run, conflict, only_modules, actions_list):
         # type: (Path, bool, str, Optional[Set[str]], List) -> None
 
-        def plan_file(src, dst, desc):
-            if dst.exists():
-                if conflict == "skip":
-                    actions_list.append(("skip", src, dst, "[跳过] {}（已存在）".format(desc)))
-                elif conflict == "overwrite":
-                    actions_list.append(("overwrite", src, dst, "[覆盖] {}".format(desc)))
-                elif conflict == "backup-existing":
-                    actions_list.append(("backup-overwrite", src, dst, "[备份+覆盖] {}".format(desc)))
-            else:
-                actions_list.append(("create", src, dst, "[新建] {}".format(desc)))
-
-        def plan_dir(src, dst, desc):
-            if not src.exists():
-                return
-            for item in src.rglob("*"):
-                if item.is_file():
-                    rel = item.relative_to(src)
-                    plan_file(item, dst / rel, "{}/{}".format(desc, rel))
+        plan_file = lambda src, dst, desc: AgentPlugin._plan_file(actions_list, conflict, src, dst, desc)
+        plan_dir = lambda src, dst, desc: AgentPlugin._plan_dir(actions_list, conflict, src, dst, desc)
 
         oc = OPENCLAW_HOME
 
@@ -1216,9 +1290,38 @@ class HermesPlugin(AgentPlugin):
     def backup(self, staging, tier):
         # type: (Path, str) -> Tuple[List[str], List[dict]]
         hm = HERMES_HOME
+        redacted_fields = []
 
-        # config.yaml
-        copy_file_if_exists(hm / "config.yaml", staging / "config.yaml", "config.yaml")
+        # config.yaml (sanitize sensitive values)
+        config_src = hm / "config.yaml"
+        if config_src.exists() and not config_src.is_symlink():
+            try:
+                with open(str(config_src), "r", encoding="utf-8") as f:
+                    content = f.read()
+                # Line-by-line scan for key: value patterns with sensitive keys
+                import re
+                sensitive_pattern = re.compile(
+                    r'^(\s*\S*(?:key|token|secret|password|credential|auth)\S*\s*:\s*)(\S.+)$',
+                    re.IGNORECASE | re.MULTILINE
+                )
+                def _redact_match(m):
+                    redacted_fields.append("config.yaml -> {}".format(m.group(1).strip().rstrip(":")))
+                    return m.group(1) + REDACTED
+                sanitized_content = sensitive_pattern.sub(_redact_match, content)
+                dst = staging / "config.yaml"
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                with open(str(dst), "w", encoding="utf-8") as f:
+                    f.write(sanitized_content)
+                msg = "config.yaml 已备份"
+                if redacted_fields:
+                    msg += "（脱敏: {} 个字段）".format(len(redacted_fields))
+                print_ok(msg)
+            except (IOError, OSError) as e:
+                print_warn("config.yaml 备份失败: {}".format(e))
+        elif config_src.is_symlink():
+            print_warn("config.yaml 是符号链接，跳过")
+        else:
+            pass  # doesn't exist
 
         # SOUL.md
         copy_file_if_exists(hm / "SOUL.md", staging / "SOUL.md", "SOUL.md")
@@ -1232,29 +1335,13 @@ class HermesPlugin(AgentPlugin):
         # cron/
         copy_dir_if_exists(hm / "cron", staging / "cron", "cron/")
 
-        return [], []
+        return redacted_fields, []
 
     def restore(self, source, dry_run, conflict, only_modules, actions_list):
         # type: (Path, bool, str, Optional[Set[str]], List) -> None
 
-        def plan_file(src, dst, desc):
-            if dst.exists():
-                if conflict == "skip":
-                    actions_list.append(("skip", src, dst, "[跳过] {}（已存在）".format(desc)))
-                elif conflict == "overwrite":
-                    actions_list.append(("overwrite", src, dst, "[覆盖] {}".format(desc)))
-                elif conflict == "backup-existing":
-                    actions_list.append(("backup-overwrite", src, dst, "[备份+覆盖] {}".format(desc)))
-            else:
-                actions_list.append(("create", src, dst, "[新建] {}".format(desc)))
-
-        def plan_dir(src, dst, desc):
-            if not src.exists():
-                return
-            for item in src.rglob("*"):
-                if item.is_file():
-                    rel = item.relative_to(src)
-                    plan_file(item, dst / rel, "{}/{}".format(desc, rel))
+        plan_file = lambda src, dst, desc: AgentPlugin._plan_file(actions_list, conflict, src, dst, desc)
+        plan_dir = lambda src, dst, desc: AgentPlugin._plan_dir(actions_list, conflict, src, dst, desc)
 
         hm = HERMES_HOME
 
@@ -1588,20 +1675,38 @@ def cmd_restore(args):
     agent_filter = getattr(args, "agents", None)
 
     # 获取文件锁
+    yes = getattr(args, "yes", False)
+    no_pull = getattr(args, "no_pull", False)
+
+    # Auto-pull before restore (unless --no-pull or --dry-run)
+    if not no_pull and repo.exists() and (repo / ".git").exists():
+        remote_check = run_git(["remote", "get-url", "origin"], cwd=repo, check=False)
+        if remote_check.returncode == 0:
+            print_info(_t("正在拉取远程最新备份...", "Pulling latest backup from remote..."))
+            pull_result = run_git(["pull", "--ff-only"], cwd=repo, check=False)
+            if pull_result.returncode == 0:
+                print_ok(_t("已拉取最新备份", "Pulled latest backup"))
+            else:
+                stderr = pull_result.stderr.strip() if pull_result.stderr else ""
+                print_warn(_t(
+                    "拉取失败（将使用本地版本）: {}".format(stderr),
+                    "Pull failed (using local version): {}".format(stderr),
+                ))
+
     lock_fd = None
     if not dry_run:
         lock_fd = acquire_lock()
 
     try:
-        _do_restore(repo, dry_run, conflict, only_modules, force, agent_filter)
+        _do_restore(repo, dry_run, conflict, only_modules, force, agent_filter, yes)
     finally:
         if lock_fd:
             release_lock(lock_fd)
 
 
-def _do_restore(repo, dry_run, conflict, only_modules, force=False, agent_filter=None):
-    # type: (Path, bool, str, Optional[Set[str]], bool, Optional[str]) -> None
-    print_header("Agent Mind Migrate 还原" + ("（DRY RUN）" if dry_run else ""))
+def _do_restore(repo, dry_run, conflict, only_modules, force=False, agent_filter=None, yes=False):
+    # type: (Path, bool, str, Optional[Set[str]], bool, Optional[str], bool) -> None
+    print_header(_t("Agent Mind Migrate 还原", "Agent Mind Migrate Restore") + (_t("（DRY RUN）", " (DRY RUN)") if dry_run else ""))
 
     if not repo.exists():
         print_fail("备份仓库不存在: {}".format(repo))
@@ -1708,12 +1813,30 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False, agent_filter
 
     if dry_run:
         print()
-        print_warn("这是 DRY RUN，未做任何实际操作")
-        print_info("确认无误后，运行不带 --dry-run 的命令来实际执行还原")
+        print_warn(_t("这是 DRY RUN，未做任何实际操作", "This was a DRY RUN — no changes were made"))
+        print_info(_t(
+            "确认无误后，运行不带 --dry-run 的命令来实际执行还原",
+            "Run the command without --dry-run to execute the restore",
+        ))
         return
 
+    # Confirmation prompt (unless --yes)
+    if not yes:
+        print()
+        prompt_msg = _t(
+            "确认执行以上还原操作？(y/N) ",
+            "Proceed with the restore? (y/N) ",
+        )
+        try:
+            answer = input(prompt_msg).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes"):
+            print_info(_t("已取消还原", "Restore cancelled"))
+            return
+
     # 实际执行
-    print_header("正在执行还原...")
+    print_header(_t("正在执行还原...", "Executing restore..."))
 
     sanitized_fields = manifest.get("sanitized_fields", [])
     file_permissions_map = manifest.get("file_permissions", {})
@@ -2232,7 +2355,7 @@ def main():
     )
     p_restore.add_argument(
         "--conflict", choices=["overwrite", "skip", "backup-existing"],
-        default="skip", help="冲突处理策略（默认: skip）",
+        default="backup-existing", help=_t("冲突处理策略（默认: backup-existing）", "Conflict strategy (default: backup-existing)"),
     )
     p_restore.add_argument(
         "--only", nargs="+", choices=sorted(RESTORE_MODULES),
@@ -2243,7 +2366,15 @@ def main():
         help="完整性校验失败时强制继续还原",
     )
     p_restore.add_argument(
-        "--agents", help="只还原指定 Agent（逗号分隔）"
+        "--agents", help=_t("只还原指定 Agent（逗号分隔）", "Restore specific agents only (comma-separated)")
+    )
+    p_restore.add_argument(
+        "--yes", "-y", action="store_true", default=False,
+        help=_t("跳过确认提示", "Skip confirmation prompt"),
+    )
+    p_restore.add_argument(
+        "--no-pull", action="store_true", default=False,
+        help=_t("不自动拉取远程更新", "Skip automatic git pull before restore"),
     )
 
     # status
@@ -2271,7 +2402,7 @@ def main():
     elif args.command == "status":
         cmd_status(args)
     elif args.command == "validate":
-        sys.exit(cmd_validate(args))
+        sys.exit(0 if cmd_validate(args) == 0 else 1)
 
 
 if __name__ == "__main__":

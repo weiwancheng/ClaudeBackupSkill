@@ -63,6 +63,6 @@
   <!-- Version badge -->
   <g transform="translate(400, 258)">
     <rect x="-20" y="-10" width="40" height="18" rx="9" fill="#6366f1" fill-opacity="0.2"/>
-    <text x="0" y="3" font-family="monospace" font-size="10" fill="#a78bfa" text-anchor="middle">v4.0</text>
+    <text x="0" y="3" font-family="monospace" font-size="10" fill="#a78bfa" text-anchor="middle">v4.1</text>
   </g>
 </svg>
