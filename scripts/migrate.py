@@ -37,6 +37,23 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+
+def _rmtree_force(path):
+    """shutil.rmtree variant that strips read-only on retry.
+
+    Required for Windows: git pack `*.idx` / `*.pack` files are checked out
+    read-only, so the default rmtree raises PermissionError when removing
+    cloned skill directories.
+    """
+    def _onerror(func, p, _exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            raise
+    shutil.rmtree(str(path), onerror=_onerror)
+
+
 # ── 常量 ──
 
 CLAUDE_HOME = Path.home() / ".claude"
@@ -543,7 +560,7 @@ def _copytree_safe(src, dst, ignore=None):
         # Windows 无管理员权限时无法创建 symlink，改为跟随
         if sys.platform == "win32":
             if Path(dst).exists():
-                shutil.rmtree(dst)
+                _rmtree_force(dst)
             shutil.copytree(src, dst, ignore=ignore, symlinks=False)
         else:
             raise
@@ -553,7 +570,7 @@ def copy_skill_local(src, dst):
     # type: (Path, Path) -> None
     """拷贝本地 skill，排除不需要的目录"""
     if dst.exists():
-        shutil.rmtree(str(dst))
+        _rmtree_force(dst)
 
     def ignore_func(directory, contents):
         return {item for item in contents if item in SKILL_EXCLUDE_DIRS}
@@ -581,7 +598,7 @@ def copy_dir_if_exists(src, dst, label):
     """如果源目录存在则拷贝，返回是否拷贝了"""
     if src.exists() and any(src.iterdir()):
         if dst.exists():
-            shutil.rmtree(str(dst))
+            _rmtree_force(dst)
         _copytree_safe(str(src), str(dst))
         print_ok("{} 已备份".format(label))
         return True
@@ -889,7 +906,7 @@ class ClaudeCodePlugin(AgentPlugin):
             if plans_src.exists() and any(plans_src.iterdir()):
                 plans_dst = staging / "plans"
                 if plans_dst.exists():
-                    shutil.rmtree(str(plans_dst))
+                    _rmtree_force(plans_dst)
                 plans_dst.mkdir(parents=True, exist_ok=True)
                 plans_count = 0
                 for item in plans_src.iterdir():
@@ -903,7 +920,7 @@ class ClaudeCodePlugin(AgentPlugin):
             if plugins_src.exists():
                 plugins_dst = staging / "plugins"
                 if plugins_dst.exists():
-                    shutil.rmtree(str(plugins_dst))
+                    _rmtree_force(plugins_dst)
 
                 def plugins_ignore(directory, contents):
                     return {
@@ -1213,7 +1230,7 @@ class OpenClawPlugin(AgentPlugin):
         if extensions_src.exists() and any(extensions_src.iterdir()):
             ext_dst = staging / "extensions"
             if ext_dst.exists():
-                shutil.rmtree(str(ext_dst))
+                _rmtree_force(ext_dst)
 
             def ext_ignore(directory, contents):
                 return {item for item in contents if item == "node_modules"}
@@ -1493,7 +1510,7 @@ def _do_backup(repo, tier, message, push, agent_filter=None):
     # 2. 原子备份：先写到临时 staging 目录
     staging_dir = repo / ".backup-staging"
     if staging_dir.exists():
-        shutil.rmtree(str(staging_dir))
+        _rmtree_force(staging_dir)
     staging_dir.mkdir(parents=True)
 
     all_sanitized_fields = []  # type: List[str]
@@ -1546,7 +1563,7 @@ def _do_backup(repo, tier, message, push, agent_filter=None):
 
     old_dir = repo / ".backup-old"
     if old_dir.exists():
-        shutil.rmtree(str(old_dir))
+        _rmtree_force(old_dir)
     old_dir.mkdir()
 
     moved_items = []
@@ -1918,7 +1935,7 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False, agent_filter
             if gitinfo is None:
                 continue
             if dst.exists():
-                shutil.rmtree(str(dst))
+                _rmtree_force(dst)
             branch = gitinfo.get("branch", "main")
             result = run_git(
                 ["clone", "-b", branch, gitinfo["remote"], str(dst)],
@@ -1946,9 +1963,12 @@ def _do_restore(repo, dry_run, conflict, only_modules, force=False, agent_filter
                 continue
             if dst.exists():
                 backup_dir = dst.with_suffix(".pre-restore")
-                if backup_dir.exists():
-                    shutil.rmtree(str(backup_dir))
-                dst.rename(backup_dir)
+                if backup_dir == dst:
+                    _rmtree_force(dst)
+                else:
+                    if backup_dir.exists():
+                        _rmtree_force(backup_dir)
+                    dst.rename(backup_dir)
             branch = gitinfo.get("branch", "main")
             result = run_git(
                 ["clone", "-b", branch, gitinfo["remote"], str(dst)],
